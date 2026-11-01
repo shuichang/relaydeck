@@ -187,7 +187,7 @@ relaydeck_health_probe() {
 
   health_file="$(mktemp)" || return 1
   status="$(
-    curl -k --silent --show-error --max-time 2 \
+    curl -k --silent --show-error --max-time 2 --noproxy '*' \
       --output "$health_file" \
       --write-out '%{http_code}' \
       "https://localhost:${port}/healthz"
