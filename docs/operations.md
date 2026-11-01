@@ -19,24 +19,24 @@ TLS 使用自签证书 `/etc/relaydeck/tls.crt` 和私钥 `/etc/relaydeck/tls.ke
 
 ## 安装、更新与卸载
 
-以下命令需要 root：
+以下命令在 root 终端执行；非 root 用户需要把 `bash` 换成 `sudo bash`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh | bash
 ```
 
 固定版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo bash -s -- --version v0.1.1
+  | bash -s -- --version v0.1.2
 ```
 
 默认从公网探测出口 IP。NAT、双线或多出口环境应显式指定入口 IP：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo env RELAYDECK_PUBLIC_IP=203.0.113.10 bash
+  | env RELAYDECK_PUBLIC_IP=203.0.113.10 bash
 ```
 
 安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制及预期版本、备份上一个二进制和 systemd unit、原子替换、重新加载 systemd、启动服务并验证健康身份。健康判定要求 unit 连续保持 active、MainPID 稳定且存活、`9443` 的 listen socket 属于该 MainPID，同时本机 `https://localhost:9443/healthz` 返回 HTTP 200 且 JSON 的 `service` 为 `relaydeck`、`version` 与刚下载二进制一致。任一项失败时，脚本成对恢复上一个二进制和原 unit；首次安装失败时移除部分安装并停止服务。
@@ -71,7 +71,7 @@ sudo systemctl start relaydeck
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo bash -s -- --uninstall
+  | bash -s -- --uninstall
 ```
 
 卸载只停止并禁用服务，删除 `relaydeck.service` 和 `/usr/local/bin/relaydeck`。`/etc/relaydeck` 与 `/var/lib/relaydeck` 默认保留。彻底删除数据需要由管理员确认备份后手动处理；脚本不会删除用户数据或其他软件。
@@ -144,7 +144,7 @@ sudo systemctl start relaydeck
 
 ```bash
 sudo tar -C / -xzf relaydeck-backup.tgz
-curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh | bash
 ```
 
 安装器不会因为认证文件已存在而再次打印密码。迁移前应确认认证文件完整，且已记录对应管理员密码。
