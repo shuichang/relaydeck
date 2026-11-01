@@ -15,6 +15,8 @@ RelayDeck 的主动出口、代理链和隧道由可选的 sing-box 内核提供
 
 当前 sing-box 1.14.4 的协议支持与限制见 [docs/research.md](docs/research.md)。WireGuard、SSH 等连接可以通过 L4 的 UDP/TCP 规则承载；主动 WireGuard/SSH 出口依赖引擎模板，模板能力受实际安装的内核版本约束。
 
+测试方法与明确的支持边界见 [docs/verification.md](docs/verification.md)。CI 包含真实 VLESS、VLESS + Reality 和 Hysteria2 的 IPv4/IPv6 转发链路测试。
+
 ## 安装
 
 要求 Linux、systemd、root 权限，以及 `curl`、`tar`、`sha256sum`。安装器支持 `amd64`、`arm64` 和 `armv7`。它从 GitHub Release 下载静态 Go 二进制，并按同一 Release 中的 `checksums.txt` 校验 SHA-256。

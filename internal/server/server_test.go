@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -171,5 +172,48 @@ func TestExportDoesNotContainAdminCredentials(t *testing.T) {
 	var cfg config.Config
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnavailableSavedRuleKeepsPanelRecoverable(t *testing.T) {
+	dir := t.TempDir()
+	if err := InitializeAuth(dir, "admin", "valid-test-password-123", false); err != nil {
+		t.Fatal(err)
+	}
+	busy, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	cfg := config.Default()
+	cfg.Rules = []config.Rule{{ID: "busy", Name: "busy", Enabled: true, Network: "tcp", Listen: busy.Addr().String(), Target: "192.0.2.1:443", MaxConnections: 16, UDPTimeout: 30}}
+	if err := config.NewStore(dir).Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{DataDir: dir, Version: "test", EngineBinary: filepath.Join(dir, "missing")})
+	if err != nil {
+		t.Fatalf("a changed environment must not lock the admin out: %v", err)
+	}
+	defer s.Close()
+	h := httptest.NewTLSServer(s.Handler())
+	defer h.Close()
+	c := h.Client()
+	c.Jar, _ = cookiejar.New(nil)
+	login(t, h, c)
+	resp, raw := request(t, c, "GET", h.URL+"/api/rules", "", "", false)
+	var rows []struct {
+		ID      string `json:"id"`
+		Error   string `json:"error"`
+		Running bool   `json:"running"`
+	}
+	if resp.StatusCode != 200 || json.Unmarshal(raw, &rows) != nil || len(rows) != 1 || rows[0].Error == "" || rows[0].Running {
+		t.Fatalf("unavailable rule is not visible for repair: %s", raw)
+	}
+	resp, raw = request(t, c, "PUT", h.URL+"/api/rules", `{"rules":[]}`, h.URL, true)
+	if resp.StatusCode != 200 {
+		t.Fatalf("could not repair startup config: %d %s", resp.StatusCode, raw)
+	}
+	if len(s.ruleSnapshots()) != 0 || s.forwardError != "" {
+		t.Fatal("startup error did not clear after repair")
 	}
 }

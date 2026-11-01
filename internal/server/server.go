@@ -30,17 +30,18 @@ type Options struct {
 }
 
 type Server struct {
-	mu       sync.Mutex
-	opts     Options
-	cfg      config.Config
-	store    *config.Store
-	auth     Credentials
-	sessions *sessions
-	forward  *forward.Manager
-	engine   *engine.Manager
-	logins   chan struct{}
-	started  time.Time
-	handler  http.Handler
+	mu           sync.Mutex
+	opts         Options
+	cfg          config.Config
+	store        *config.Store
+	auth         Credentials
+	sessions     *sessions
+	forward      *forward.Manager
+	forwardError string
+	engine       *engine.Manager
+	logins       chan struct{}
+	started      time.Time
+	handler      http.Handler
 }
 
 func New(opts Options) (*Server, error) {
@@ -59,8 +60,8 @@ func New(opts Options) (*Server, error) {
 		logins: make(chan struct{}, 2),
 	}
 	if err = s.forward.Apply(c.Rules); err != nil {
-		s.Close()
-		return nil, fmt.Errorf("恢复转发规则失败: %w", err)
+		s.forwardError = fmt.Sprintf("恢复转发规则失败: %v", err)
+		log.Print(s.forwardError)
 	}
 	// A missing optional engine must not take the management UI or native forwarding down.
 	if err = s.engine.Apply(c.Engine); err != nil {
@@ -227,7 +228,7 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	case "GET /api/status":
 		s.status(w)
 	case "GET /api/rules":
-		rows := s.forward.Snapshot()
+		rows := s.ruleSnapshots()
 		if rows == nil {
 			rows = []forward.Snapshot{}
 		}
@@ -256,7 +257,7 @@ func (s *Server) status(w http.ResponseWriter) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	hostname, _ := os.Hostname()
-	rows := s.forward.Snapshot()
+	rows := s.ruleSnapshots()
 	var active, connections, udp int64
 	var in, out uint64
 	for _, row := range rows {
@@ -287,6 +288,25 @@ func (s *Server) engineState() engine.Snapshot {
 	es.Config = append(json.RawMessage(nil), s.cfg.Engine.Config...)
 	s.mu.Unlock()
 	return es
+}
+
+func (s *Server) ruleSnapshots() []forward.Snapshot {
+	rows := s.forward.Snapshot()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.forwardError == "" {
+		return rows
+	}
+	rows = make([]forward.Snapshot, 0, len(s.cfg.Rules))
+	for _, rule := range s.cfg.Rules {
+		rule.AllowedCIDRs = append([]string(nil), rule.AllowedCIDRs...)
+		row := forward.Snapshot{Rule: rule}
+		if rule.Enabled {
+			row.Error = s.forwardError
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 func (s *Server) putRules(w http.ResponseWriter, r *http.Request) {
@@ -329,13 +349,18 @@ func (s *Server) putRules(w http.ResponseWriter, r *http.Request) {
 	next := old
 	next.Rules = b.Rules
 	if err := s.store.Save(next); err != nil {
-		if rollback := s.forward.Apply(old.Rules); rollback != nil {
+		rollbackRules := old.Rules
+		if s.forwardError != "" {
+			rollbackRules = nil
+		}
+		if rollback := s.forward.Apply(rollbackRules); rollback != nil {
 			log.Printf("CRITICAL: config rollback failed: %v", rollback)
 		}
 		fail(w, 500, "配置写入失败，已尝试恢复原规则")
 		return
 	}
 	s.cfg = next
+	s.forwardError = ""
 	writeJSON(w, 200, s.forward.Snapshot())
 }
 
