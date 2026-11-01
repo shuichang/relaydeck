@@ -56,7 +56,7 @@ esac
 
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then
   if [[ -x "$TARGET" ]]; then
-    existing="$("$TARGET" version 2>/dev/null | head -n 1 || true)"
+    existing="$("$TARGET" version 2>/dev/null | sed -n '1p' || true)"
     case "$existing" in
       *"${VERSION}"*)
         printf 'sing-box %s is already installed at %s.\n' "$VERSION" "$TARGET"
@@ -89,7 +89,13 @@ actual="$(sha256sum "$archive" | awk '{ print tolower($1) }')"
 [[ "$actual" == "$expected" ]] \
   || die "SHA-256 mismatch for ${asset}: expected ${expected}, got ${actual}"
 
-member="$(tar -tzf "$archive" | awk -v name="sing-box-${VERSION}-linux-${arch}/sing-box" '$0 == name { print; exit }')"
+member="$(
+  tar -tzf "$archive" |
+    awk -v name="sing-box-${VERSION}-linux-${arch}/sing-box" '
+      $0 == name && !found { found = $0 }
+      END { print found }
+    '
+)"
 [[ "$member" == "sing-box-${VERSION}-linux-${arch}/sing-box" ]] \
   || die "release archive does not contain the expected sing-box binary"
 tar -xzOf "$archive" "$member" > "$stage"

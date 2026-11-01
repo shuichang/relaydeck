@@ -8,6 +8,7 @@ go test -race ./...
 go vet ./...
 bash -n scripts/install.sh scripts/install-sing-box.sh
 shellcheck scripts/install.sh scripts/install-sing-box.sh
+bash scripts/test-installer.sh
 ```
 
 真实协议集成测试需要 sing-box 1.14.4；普通 `go test ./...` 在未指定内核时跳过该项：
@@ -28,9 +29,11 @@ CI 对分支 push、PR 和版本 tag 执行普通测试、竞态检测、静态�
 - UDP 空报文、报文边界、会话限制与空闲回收。
 - CIDR 白名单、监听冲突、自转发直接环路与超大参数检查。
 - 配置绑定失败回滚、磁盘保存失败回滚、未改规则的会话保留。
+- 完整序列化配置的大小限制、缩进膨胀与规则/内核配置合并后的容量检查。
 - HTTPS 管理会话、CSRF、来源校验、登录限速、密码修改及会话撤销。
 - 启动时目标解析或端口绑定失败仍保留管理入口，显示待修复规则。
 - 可选内核配置检查、进程启停、崩溃恢复、启动失败回滚及日志脱敏。
+- 内核跨进程周期的连续崩溃预算；稳定运行后重置退避状态。
 - 九份 sing-box 配置模板的 JSON 结构及内核兼容性。
 
 ## 不能由这些测试证明的内容

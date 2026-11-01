@@ -58,12 +58,30 @@ func (s *Store) Load() (Config, error) {
 func (s *Store) Save(c Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c.Version = 1
-	b, err := json.MarshalIndent(c, "", "  ")
+	b, err := encode(c)
 	if err != nil {
 		return err
 	}
-	return WritePrivate(s.path, append(b, '\n'))
+	return WritePrivate(s.path, b)
+}
+
+// ValidateSize checks the complete final representation before changing runtime
+// state. Limits apply to the combined rules and engine configuration.
+func ValidateSize(c Config) error {
+	_, err := encode(c)
+	return err
+}
+
+func encode(c Config) ([]byte, error) {
+	c.Version = 1
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(b)+1 > MaxFileSize {
+		return nil, fmt.Errorf("序列化后的完整配置超过 %d 字节，请减少规则或内核配置", MaxFileSize)
+	}
+	return append(b, '\n'), nil
 }
 
 // WritePrivate replaces a file only after the entire new content has been synced.

@@ -19,19 +19,21 @@ RelayDeck 的主动出口、代理链和隧道由可选的 sing-box 内核提供
 
 ## 安装
 
-要求 Linux、systemd、root 权限，以及 `curl`、`tar`、`sha256sum`。安装器支持 `amd64`、`arm64` 和 `armv7`。它从 GitHub Release 下载静态 Go 二进制，并按同一 Release 中的 `checksums.txt` 校验 SHA-256。
+要求 Linux、systemd、root 权限，以及 `curl`、`tar`、`sha256sum`、`ss`（Debian 的 `iproute2` 包）。安装器支持 `amd64`、`arm64` 和 `armv7`。它从 GitHub Release 下载静态 Go 二进制，并按同一 Release 中的 `checksums.txt` 校验 SHA-256。
 
 公开仓库：<https://github.com/shuichang/relaydeck>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh | bash
 ```
+
+以上命令在 root 终端执行。非 root 用户才需要把 `bash` 换成 `sudo bash`，下面的参数形式也应相应写成 `sudo bash -s -- ...`。
 
 安装最新 Release。需要固定版本时，在安装脚本后传参：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo bash -s -- --version v0.1.0
+  | bash -s -- --version v0.1.1
 ```
 
 首次安装会：
@@ -45,16 +47,16 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo env RELAYDECK_PUBLIC_IP=203.0.113.10 bash
+  | env RELAYDECK_PUBLIC_IP=203.0.113.10 bash
 ```
 
-重复执行安装命令即为更新。更新会保留 `/var/lib/relaydeck` 中的认证和配置、`/etc/relaydeck` 中的证书与配置，不会重置管理员密码。安装器会先备份原二进制与原 systemd unit，再原子替换并检查 `/healthz`；失败时成对恢复，避免不兼容的新 unit 留在旧二进制旁边。
+重复执行安装命令即为更新。更新会保留 `/var/lib/relaydeck` 中的认证和配置、`/etc/relaydeck` 中的证书与配置，不会重置管理员密码。安装器会先备份原二进制与原 systemd unit，再原子替换。启动后要连续确认 unit 持续 active、MainPID 稳定且存活、9443 的监听 socket 属于该 PID，并核对 `/healthz` 的同一服务名和版本；任一项不符都会成对恢复，避免其他同端口 HTTPS 服务造成误判。
 
 卸载只移除程序与 systemd 单元：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo bash -s -- --uninstall
+  | bash -s -- --uninstall
 ```
 
 `/var/lib/relaydeck` 和 `/etc/relaydeck` 默认保留，便于重装或迁移。脚本不会卸载其他软件，不会修改全局 sysctl，也不会增删防火墙规则。
@@ -80,7 +82,7 @@ systemd 单元启用了文件系统、设备、内核、命名空间、系统调
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install-sing-box.sh \
-  | sudo bash
+  | bash
 ```
 
 三个支持架构的归档 SHA-256 已固定在脚本中，来源为 GitHub Release API 的资产 digest。上游没有独立的签名或 `checksums.txt`；该步骤是发布资产完整性校验，不应描述为上游数字签名验证。如果目标路径已有不同版本的 sing-box，脚本会拒绝覆盖，除非显式传入 `--force`。

@@ -36,7 +36,11 @@ jobs:
         run: |
           bash -n scripts/install.sh
           bash -n scripts/install-sing-box.sh
-          shellcheck scripts/install.sh scripts/install-sing-box.sh
+          bash -n scripts/test-installer.sh
+          shellcheck scripts/install.sh scripts/install-sing-box.sh scripts/test-installer.sh
+
+      - name: Installer health regression
+        run: bash scripts/test-installer.sh
 
       - name: Test
         run: go test ./...

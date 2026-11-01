@@ -23,10 +23,18 @@ const (
 	versionTimeout       = 3 * time.Second
 	startupGracePeriod   = 600 * time.Millisecond
 	stopGracePeriod      = 3 * time.Second
-	maxRestartAttempts   = 5
+	stableRunWindow      = 60 * time.Second
 )
 
 var defaultEngineConfig = json.RawMessage(`{}`)
+
+var defaultRestartDelays = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+}
 
 // Snapshot is the engine state exposed by the HTTP API.
 type Snapshot struct {
@@ -48,28 +56,36 @@ type Manager struct {
 	opMu sync.Mutex
 	mu   sync.Mutex
 
-	binaryPath  string
-	available   bool
-	version     string
-	lastProbe   time.Time
-	probeMu     sync.Mutex
-	desired     config.Engine
-	configBytes []byte
-	configPath  string
-	proc        *managedProcess
-	revision    uint64
-	errorText   string
-	closed      bool
-	closeOnce   sync.Once
-	closeCh     chan struct{}
-	logs        *logRing
+	binaryPath      string
+	available       bool
+	version         string
+	lastProbe       time.Time
+	probeMu         sync.Mutex
+	desired         config.Engine
+	configBytes     []byte
+	configPath      string
+	proc            *managedProcess
+	revision        uint64
+	errorText       string
+	restartAttempts int
+	closed          bool
+	closeOnce       sync.Once
+	closeCh         chan struct{}
+	logs            *logRing
+
+	// Timing knobs are initialized for production and shortened by package
+	// tests. They are immutable after construction outside tests.
+	startupGrace    time.Duration
+	stableRunWindow time.Duration
+	restartDelays   []time.Duration
 }
 
 type managedProcess struct {
-	cmd      *exec.Cmd
-	exited   chan struct{}
-	exitErr  error
-	stopping bool
+	cmd       *exec.Cmd
+	exited    chan struct{}
+	exitErr   error
+	stopping  bool
+	startedAt time.Time
 }
 
 // New creates an optional engine manager. An empty binary name resolves
@@ -83,10 +99,13 @@ func New(dataDir, binary string) *Manager {
 		dataDir = filepath.Join(os.TempDir(), "relaydeck-engine")
 	}
 	manager := &Manager{
-		dataDir:    filepath.Clean(dataDir),
-		binarySpec: binary,
-		closeCh:    make(chan struct{}),
-		logs:       newLogRing(defaultLogCapacity),
+		dataDir:         filepath.Clean(dataDir),
+		binarySpec:      binary,
+		closeCh:         make(chan struct{}),
+		logs:            newLogRing(defaultLogCapacity),
+		startupGrace:    startupGracePeriod,
+		stableRunWindow: stableRunWindow,
+		restartDelays:   append([]time.Duration(nil), defaultRestartDelays...),
 	}
 	_, _ = manager.ensureBinary(true)
 	return manager
@@ -165,6 +184,7 @@ func (m *Manager) Apply(candidate config.Engine) error {
 	if sameConfig && oldProcess != nil && processStillRunning(oldProcess) {
 		m.mu.Lock()
 		m.desired.Enabled = true
+		m.restartAttempts = 0
 		m.errorText = ""
 		m.mu.Unlock()
 		m.logs.replaceSecrets(newSecrets)
@@ -202,6 +222,7 @@ func (m *Manager) Apply(candidate config.Engine) error {
 		oldPath := m.configPath
 		m.configPath = checkPath
 		m.revision++
+		m.restartAttempts = 0
 		m.errorText = ""
 		deleteOldPath := oldPath != "" && oldPath != checkPath
 		m.mu.Unlock()
@@ -247,6 +268,7 @@ func (m *Manager) commitDisabled(candidate config.Engine, canonical []byte, remo
 	m.configBytes = append([]byte(nil), canonical...)
 	m.configPath = ""
 	m.revision++
+	m.restartAttempts = 0
 	m.errorText = ""
 	m.mu.Unlock()
 
@@ -361,13 +383,43 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) observeProcess(process *managedProcess) {
+	stableTimer := time.NewTimer(m.stableRunWindow)
+	defer stableTimer.Stop()
 	select {
 	case <-process.exited:
+		stableTimer.Stop()
+		m.logs.flushPartial()
+		m.handleProcessExit(process)
+		return
+	case <-stableTimer.C:
+		m.markProcessStable(process)
 	case <-m.closeCh:
 		return
 	}
-	m.logs.flushPartial()
 
+	select {
+	case <-process.exited:
+		m.logs.flushPartial()
+		m.handleProcessExit(process)
+	case <-m.closeCh:
+	}
+}
+
+func (m *Manager) markProcessStable(process *managedProcess) {
+	m.mu.Lock()
+	if m.proc != process || process.stopping || m.closed || !processStillRunning(process) {
+		m.mu.Unlock()
+		return
+	}
+	previousAttempts := m.restartAttempts
+	m.restartAttempts = 0
+	m.mu.Unlock()
+	if previousAttempts > 0 {
+		m.logs.append(-1, "sing-box 已稳定运行 "+m.stableRunWindow.String()+"，自动重启预算已复位")
+	}
+}
+
+func (m *Manager) handleProcessExit(process *managedProcess) {
 	m.mu.Lock()
 	if m.proc != process {
 		m.mu.Unlock()
@@ -380,12 +432,37 @@ func (m *Manager) observeProcess(process *managedProcess) {
 	revision := m.revision
 	errorText := processExitText(process.exitErr)
 	secrets := secretsFromConfig(m.configBytes)
+	exhausted := false
+	stableReset := false
 	if !stopping && enabled && !closed {
-		m.errorText = redactText("sing-box 意外退出: "+errorText+"，正在自动重启", secrets)
+		if m.restartAttempts > 0 &&
+			!process.startedAt.IsZero() &&
+			time.Since(process.startedAt) >= m.stableRunWindow {
+			m.restartAttempts = 0
+			stableReset = true
+		}
+		if m.restartAttempts >= len(m.restartDelays) {
+			exhausted = true
+			m.errorText = redactText(
+				fmt.Sprintf("sing-box 连续崩溃，%d 次自动重启预算已耗尽（最近退出: %s）；请重新应用配置或手动重启",
+					len(m.restartDelays), errorText),
+				secrets,
+			)
+		} else {
+			m.errorText = redactText("sing-box 意外退出: "+errorText+"，正在自动重启", secrets)
+		}
 	}
 	m.mu.Unlock()
 
 	if stopping || !enabled || closed {
+		return
+	}
+	if stableReset {
+		m.logs.append(-1, "sing-box 已稳定运行 "+m.stableRunWindow.String()+"，自动重启预算已复位")
+	}
+	if exhausted {
+		m.logs.replaceSecrets(secrets)
+		m.logs.append(-1, "自动重启预算已耗尽: "+errorText)
 		return
 	}
 	m.logs.replaceSecrets(secrets)
@@ -394,10 +471,41 @@ func (m *Manager) observeProcess(process *managedProcess) {
 }
 
 func (m *Manager) restartLoop(revision uint64) {
-	delays := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
 	var lastError string
-	for attempt := 0; attempt < maxRestartAttempts; attempt++ {
-		delay := delays[attempt]
+	for {
+		m.mu.Lock()
+		if m.closed || !m.desired.Enabled || m.revision != revision || m.proc != nil {
+			m.mu.Unlock()
+			return
+		}
+		limit := len(m.restartDelays)
+		if m.restartAttempts >= limit {
+			detail := lastError
+			if detail == "" {
+				detail = "进程未能保持稳定运行"
+			}
+			m.errorText = redactText(
+				fmt.Sprintf("sing-box 连续自动重启 %d 次失败: %s；请重新应用配置或手动重启", limit, detail),
+				secretsFromConfig(m.configBytes),
+			)
+			m.mu.Unlock()
+			m.logs.append(-1, "自动重启预算已耗尽: "+detail)
+			return
+		}
+		attempt := m.restartAttempts + 1
+		delay := m.restartDelays[attempt-1]
+		m.restartAttempts = attempt
+		configBytes := append([]byte(nil), m.configBytes...)
+		configPath := m.configPath
+		secrets := secretsFromConfig(configBytes)
+		m.errorText = redactText(
+			fmt.Sprintf("sing-box 意外退出，%s 后执行自动重启 (%d/%d)", delay, attempt, limit),
+			secrets,
+		)
+		m.mu.Unlock()
+
+		m.logs.replaceSecrets(secrets)
+		m.logs.append(-1, fmt.Sprintf("自动重启 %d/%d，等待 %s", attempt, limit, delay))
 		if !m.waitRetry(delay) {
 			return
 		}
@@ -409,17 +517,8 @@ func (m *Manager) restartLoop(revision uint64) {
 			m.opMu.Unlock()
 			return
 		}
-		configBytes := append([]byte(nil), m.configBytes...)
-		configPath := m.configPath
-		m.mu.Unlock()
-
-		m.mu.Lock()
-		if m.available {
-			m.errorText = redactText(
-				fmt.Sprintf("sing-box 意外退出，%s 后执行自动重启 (%d/%d)", delay, attempt+1, maxRestartAttempts),
-				secretsFromConfig(configBytes),
-			)
-		}
+		configBytes = append([]byte(nil), m.configBytes...)
+		configPath = m.configPath
 		m.mu.Unlock()
 
 		binaryPath, err := m.ensureBinary(false)
@@ -437,8 +536,9 @@ func (m *Manager) restartLoop(revision uint64) {
 			err = errors.New(redactText("sing-box 自动重启后立即退出: "+processExitText(process.exitErr), secretsFromConfig(configBytes)))
 		}
 		if err != nil {
-			lastError = redactText(err.Error(), secretsFromConfig(configBytes))
+			lastError = redactText(err.Error(), secrets)
 			m.setError(lastError)
+			m.logs.append(-1, fmt.Sprintf("自动重启 %d/%d 失败: %s", attempt, limit, lastError))
 			m.opMu.Unlock()
 			continue
 		}
@@ -456,16 +556,11 @@ func (m *Manager) restartLoop(revision uint64) {
 		}
 		m.errorText = ""
 		m.mu.Unlock()
-		m.logs.append(-1, fmt.Sprintf("sing-box 自动重启成功 (%d/%d)", attempt+1, maxRestartAttempts))
+		m.logs.append(-1, fmt.Sprintf("sing-box 自动重启成功 (%d/%d)", attempt, limit))
 		go m.observeProcess(process)
 		m.opMu.Unlock()
 		return
 	}
-	if lastError == "" {
-		lastError = "进程未能保持运行"
-	}
-	m.setError("sing-box 连续自动重启 5 次失败: " + lastError)
-	m.logs.append(-1, "sing-box 自动重启已停止: "+lastError)
 }
 
 func (m *Manager) waitRetry(delay time.Duration) bool {
@@ -484,7 +579,7 @@ func (m *Manager) startAndWait(binaryPath, configPath string, configBytes []byte
 	if err != nil {
 		return nil, err
 	}
-	timer := time.NewTimer(startupGracePeriod)
+	timer := time.NewTimer(m.startupGrace)
 	defer timer.Stop()
 	select {
 	case <-process.exited:
@@ -509,8 +604,9 @@ func (m *Manager) startProcess(binaryPath, configPath string) (*managedProcess, 
 	}
 
 	process := &managedProcess{
-		cmd:    cmd,
-		exited: make(chan struct{}),
+		cmd:       cmd,
+		exited:    make(chan struct{}),
+		startedAt: time.Now(),
 	}
 
 	go func() {

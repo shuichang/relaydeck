@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | sudo bash -s -- --version v0.1.0
+  | sudo bash -s -- --version v0.1.1
 ```
 
 默认从公网探测出口 IP。NAT、双线或多出口环境应显式指定入口 IP：
@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
   | sudo env RELAYDECK_PUBLIC_IP=203.0.113.10 bash
 ```
 
-安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制版本、备份上一个二进制和 systemd unit、原子替换、重新加载 systemd、启动服务并访问本机 HTTPS `/healthz`。健康检查失败时，脚本成对恢复上一个二进制和原 unit；首次安装失败时移除部分安装并停止服务。
+安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制及预期版本、备份上一个二进制和 systemd unit、原子替换、重新加载 systemd、启动服务并验证健康身份。健康判定要求 unit 连续保持 active、MainPID 稳定且存活、`9443` 的 listen socket 属于该 MainPID，同时本机 `https://localhost:9443/healthz` 返回 HTTP 200 且 JSON 的 `service` 为 `relaydeck`、`version` 与刚下载二进制一致。任一项失败时，脚本成对恢复上一个二进制和原 unit；首次安装失败时移除部分安装并停止服务。
 
 重复安装会更新单元和程序，保留：
 
@@ -108,12 +108,20 @@ sudo systemctl restart relaydeck
 ```bash
 sudo systemctl status relaydeck --no-pager
 sudo journalctl -u relaydeck --since "30 minutes ago"
-curl -kfsS https://127.0.0.1:9443/healthz
+curl -kfsS https://localhost:9443/healthz
 relaydeck version
 sudo relaydeck check --data /var/lib/relaydeck
 ```
 
 `curl -k` 只用于本机确认服务是否响应，不应用于传播证书或关闭客户端验证。外部访问应通过浏览器接受自签例外，或导入明确的证书指纹。
+
+安装健康检查不只看 `curl` 的 200。监听端口被其他 HTTPS 服务占用时，RelayDeck 的 MainPID 不拥有该 socket，或响应中的服务名/版本不一致，安装都会失败并回滚。安装器只停止自己的 `relaydeck.service`，不会结束占用端口的外部进程。
+
+可用独立随机回环端口验证这些判定和 tar 管道行为。测试需要 `go`、`openssl`、`curl` 和 `ss`，使用替身 systemd 状态与现场构建的临时 Go HTTPS 服务，明确避开 `9443`：
+
+```bash
+bash scripts/test-installer.sh
+```
 
 查看证书指纹：
 

@@ -20,7 +20,7 @@ Usage:
   install.sh --uninstall
 
 Environment:
-  RELAYDECK_VERSION     Release tag, for example v0.1.0
+  RELAYDECK_VERSION     Release tag, for example v0.1.1
   RELAYDECK_PUBLIC_IP   Public IP to put in the self-signed certificate
 
 Re-running the installer performs an update and preserves auth/configuration.
@@ -76,7 +76,7 @@ if ((uninstall)); then
   exit 0
 fi
 
-for cmd in curl tar sha256sum install od tr; do
+for cmd in curl tar sha256sum install od tr ss; do
   command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
 done
 
@@ -137,6 +137,104 @@ atomic_install() {
   staged_file=""
 }
 
+# BEGIN HEALTH CHECK HELPERS
+relaydeck_probe_pid=""
+
+relaydeck_port_owned_by_pid() {
+  local port="$1"
+  local expected_pid="$2"
+  local listeners line local_address process_info matched=0
+
+  listeners="$(ss -H -ltnp 2>/dev/null)" || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r _ _ _ local_address process_info <<< "$line"
+    [[ "$local_address" == *":${port}" ]] || continue
+    matched=1
+    [[ "$process_info" == *"pid=${expected_pid},"* ]] || return 1
+  done <<< "$listeners"
+  ((matched == 1))
+}
+
+relaydeck_health_identity_matches() {
+  local body="$1"
+  local expected_version="$2"
+  local actual_version
+
+  [[ "$body" =~ \"status\"[[:space:]]*:[[:space:]]*\"ok\" ]] || return 1
+  [[ "$body" =~ \"service\"[[:space:]]*:[[:space:]]*\"relaydeck\" ]] || return 1
+  actual_version="$(
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<< "$body"
+  )"
+  [[ "$actual_version" == "$expected_version" ]]
+}
+
+# A Type=simple unit can report a successful start before its child exits on
+# bind failure. Each probe therefore ties the listener and HTTP identity to a
+# live, changing-safe MainPID. The caller requires several consecutive passes.
+relaydeck_health_probe() {
+  local unit="$1"
+  local port="$2"
+  local expected_version="$3"
+  local main_pid health_file status body
+
+  relaydeck_probe_pid=""
+  systemctl is-active --quiet "$unit" || return 1
+  main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)" || return 1
+  [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$main_pid" 2>/dev/null || return 1
+  relaydeck_port_owned_by_pid "$port" "$main_pid" || return 1
+
+  health_file="$(mktemp)" || return 1
+  status="$(
+    curl -k --silent --show-error --max-time 2 \
+      --output "$health_file" \
+      --write-out '%{http_code}' \
+      "https://localhost:${port}/healthz"
+  )" || {
+    rm -f -- "$health_file"
+    return 1
+  }
+  if [[ "$status" != "200" ]]; then
+    rm -f -- "$health_file"
+    return 1
+  fi
+  body="$(< "$health_file")"
+  rm -f -- "$health_file"
+
+  relaydeck_health_identity_matches "$body" "$expected_version" || return 1
+  relaydeck_probe_pid="$main_pid"
+}
+
+wait_for_relaydeck_health() {
+  local unit="$1"
+  local port="$2"
+  local expected_version="$3"
+  local max_attempts="$4"
+  local required_stable="$5"
+  local stable_pid=""
+  local consecutive=0
+  local attempt
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    # shellcheck disable=SC2310 # probe uses explicit returns and no set -e side effects
+    if relaydeck_health_probe "$unit" "$port" "$expected_version"; then
+      if [[ -z "$stable_pid" || "$relaydeck_probe_pid" != "$stable_pid" ]]; then
+        stable_pid="$relaydeck_probe_pid"
+        consecutive=1
+      else
+        consecutive=$((consecutive + 1))
+      fi
+    else
+      consecutive=0
+    fi
+    ((consecutive >= required_stable)) && return 0
+    sleep 1
+  done
+  return 1
+}
+# END HEALTH CHECK HELPERS
+
 checksums="${tmpdir}/checksums.txt"
 download "${release_base}/checksums.txt" "$checksums"
 [[ -s "$checksums" ]] || die "release checksums.txt is empty"
@@ -176,7 +274,8 @@ actual="$(sha256sum "$archive" | awk '{ print tolower($1) }')"
 [[ "$actual" == "$expected" ]] \
   || die "SHA-256 mismatch for ${asset}: expected ${expected}, got ${actual}"
 
-tar -tzf "$archive" | grep -qx 'relaydeck' \
+tar -tzf "$archive" > "${tmpdir}/archive.list"
+grep -Fxq 'relaydeck' "${tmpdir}/archive.list" \
   || die "release archive does not contain the expected relaydeck binary"
 tar -xzOf "$archive" 'relaydeck' > "${tmpdir}/relaydeck"
 [[ -s "${tmpdir}/relaydeck" ]] || die "release binary is empty"
@@ -184,10 +283,9 @@ chmod 0700 "${tmpdir}/relaydeck"
 
 installed_version="$("${tmpdir}/relaydeck" version 2>&1)" \
   || die "downloaded binary cannot execute on this host"
-case "$installed_version" in
-  *"$version"*) ;;
-  *) die "downloaded binary version does not match ${tag}: ${installed_version}" ;;
-esac
+read -r _ expected_health_version _ <<< "$installed_version"
+[[ "$expected_health_version" == "v${version}" ]] \
+  || die "downloaded binary version does not match ${tag}: ${installed_version}"
 
 public_ip="${RELAYDECK_PUBLIC_IP:-}"
 
@@ -334,17 +432,16 @@ fi
 
 healthy=0
 if ((install_ok)); then
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    if curl -kfsS --max-time 2 https://127.0.0.1:9443/healthz >/dev/null 2>&1; then
-      healthy=1
-      break
-    fi
-    sleep 1
-  done
+  wait_for_relaydeck_health \
+    relaydeck.service 9443 "$expected_health_version" 30 5 \
+    && healthy=1
 fi
 
 if ((healthy == 0)); then
   systemctl status relaydeck.service --no-pager -l >&2 || true
+  systemctl show --property=ActiveState --property=SubState --property=MainPID \
+    relaydeck.service >&2 || true
+  ss -H -ltnp 'sport = :9443' >&2 || true
   restore_previous
   if ((had_previous_bin && had_previous_unit)); then
     systemctl restart relaydeck.service || true

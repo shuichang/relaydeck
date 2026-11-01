@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -215,5 +216,92 @@ func TestUnavailableSavedRuleKeepsPanelRecoverable(t *testing.T) {
 	}
 	if len(s.ruleSnapshots()) != 0 || s.forwardError != "" {
 		t.Fatal("startup error did not clear after repair")
+	}
+}
+
+func TestOversizedFinalConfigIsRejectedBeforeRuntimeChanges(t *testing.T) {
+	s, h, c, dir := testServer(t)
+	login(t, h, c)
+	if err := config.NewStore(dir).Save(config.Default()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	before, _ := os.ReadFile(path)
+	cidrs := make([]string, 128)
+	for i := range cidrs {
+		cidrs[i] = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128"
+	}
+	rules := make([]config.Rule, 512)
+	for i := range rules {
+		rules[i] = config.Rule{
+			ID: fmt.Sprintf("%0128d", i), Name: strings.Repeat("n", 256),
+			Network: "udp", Listen: "127.0.0.1:21453", Target: strings.Repeat("a", 1024) + ".example:443",
+			AllowedCIDRs: cidrs, MaxConnections: 16, UDPTimeout: 30,
+		}
+	}
+	body, err := json.Marshal(map[string]any{"rules": rules})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) >= config.MaxFileSize {
+		t.Fatalf("test must fit the API request limit: %d", len(body))
+	}
+	resp, raw := request(t, c, "PUT", h.URL+"/api/rules", string(body), h.URL, true)
+	if resp.StatusCode != 400 || !bytes.Contains(raw, []byte("完整配置")) {
+		t.Fatalf("oversized final config was not rejected during preflight: %d %s", resp.StatusCode, raw)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) || len(s.forward.Snapshot()) != 0 {
+		t.Fatal("size rejection changed persisted or runtime rules")
+	}
+	if _, err := config.NewStore(dir).Load(); err != nil {
+		t.Fatalf("rejected update left an unloadable configuration: %v", err)
+	}
+}
+
+func TestSizeLimitIncludesBothRulesAndEngineAndAllowsRepair(t *testing.T) {
+	s, h, c, dir := testServer(t)
+	login(t, h, c)
+	cfg := config.Default()
+	cfg.Engine.Config = json.RawMessage(`{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"action":"route","outbound":"direct","domain_suffix":[` + strings.Repeat(`"example.com",`, 100000) + `"example.com"]}]}}`)
+	if err := s.store.Save(cfg); err != nil {
+		t.Fatal("fixture engine config must fit on its own", err)
+	}
+	// Model a saved optional-engine configuration with its binary unavailable.
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+	path := filepath.Join(dir, "config.json")
+	before, _ := os.ReadFile(path)
+	cidrs := make([]string, 64)
+	for i := range cidrs {
+		cidrs[i] = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128"
+	}
+	rules := make([]config.Rule, 512)
+	for i := range rules {
+		rules[i] = config.Rule{ID: fmt.Sprintf("%0128d", i), Name: strings.Repeat("n", 256), Network: "udp", Listen: "127.0.0.1:21453", Target: "192.0.2.1:443", AllowedCIDRs: cidrs, MaxConnections: 16, UDPTimeout: 30}
+	}
+	body, err := json.Marshal(map[string]any{"rules": rules})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, raw := request(t, c, "PUT", h.URL+"/api/rules", string(body), h.URL, true)
+	if resp.StatusCode != 400 || !bytes.Contains(raw, []byte("完整配置")) {
+		t.Fatalf("combined size limit missing: %d %s", resp.StatusCode, raw)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) || len(s.forward.Snapshot()) != 0 {
+		t.Fatal("combined-size rejection changed existing state")
+	}
+	resp, raw = request(t, c, "PUT", h.URL+"/api/engine", `{"enabled":false,"config":{}}`, h.URL, true)
+	if resp.StatusCode != 200 {
+		t.Fatalf("could not reduce the engine configuration to repair capacity: %d %s", resp.StatusCode, raw)
+	}
+	resp, raw = request(t, c, "PUT", h.URL+"/api/rules", string(body), h.URL, true)
+	if resp.StatusCode != 200 {
+		t.Fatalf("rules which fit after reducing engine config should save: %d %s", resp.StatusCode, raw)
+	}
+	if _, err := config.NewStore(dir).Load(); err != nil {
+		t.Fatal("the resulting configuration must remain loadable", err)
 	}
 }

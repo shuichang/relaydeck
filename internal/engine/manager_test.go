@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,7 +63,19 @@ func runEngineHelper(args []string) int {
 				_ = os.WriteFile(statePath, []byte("crashed\n"), 0600)
 				// Exit after the manager's startup grace period so the process
 				// is registered first and exercises the unexpected-exit path.
-				time.Sleep(startupGracePeriod + 200*time.Millisecond)
+				time.Sleep(helperCrashDelay(content))
+				return 3
+			}
+		}
+		if cycles := helperInt(content, "crash_cycles"); cycles > 0 {
+			statePath := os.Getenv("RELAYDECK_ENGINE_HELPER_STATE")
+			count := 0
+			if raw, err := os.ReadFile(statePath); err == nil {
+				count, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+			}
+			if count < cycles {
+				_ = os.WriteFile(statePath, []byte(strconv.Itoa(count+1)+"\n"), 0600)
+				time.Sleep(helperCrashDelay(content))
 				return 3
 			}
 		}
@@ -108,6 +121,18 @@ func readHelperConfig(path string) (map[string]any, map[string]bool) {
 func helperString(content map[string]any, key string) string {
 	value, _ := content[key].(string)
 	return value
+}
+
+func helperInt(content map[string]any, key string) int {
+	value, _ := content[key].(float64)
+	return int(value)
+}
+
+func helperCrashDelay(content map[string]any) time.Duration {
+	if milliseconds := helperInt(content, "crash_after_ms"); milliseconds > 0 {
+		return time.Duration(milliseconds) * time.Millisecond
+	}
+	return startupGracePeriod + 200*time.Millisecond
 }
 
 func helperManager(t *testing.T, dir string) (*Manager, string) {
@@ -303,6 +328,121 @@ func TestUnexpectedExitRestartsWithBackoff(t *testing.T) {
 			t.Fatalf("process did not recover after unexpected exit: %+v", snapshot)
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func TestRestartBudgetPersistsAcrossShortLivedRuns(t *testing.T) {
+	dir := t.TempDir()
+	manager, record := helperManager(t, dir)
+	manager.startupGrace = 10 * time.Millisecond
+	manager.stableRunWindow = 200 * time.Millisecond
+	manager.restartDelays = []time.Duration{
+		15 * time.Millisecond,
+		20 * time.Millisecond,
+		25 * time.Millisecond,
+		30 * time.Millisecond,
+		35 * time.Millisecond,
+	}
+
+	engineConfig := json.RawMessage(`{
+		"password":"restart-secret",
+		"crash_cycles":6,
+		"crash_after_ms":30
+	}`)
+	if err := manager.Apply(config.Engine{Enabled: true, Config: engineConfig}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		return strings.Contains(manager.Snapshot().Error, "自动重启预算已耗尽")
+	})
+
+	manager.mu.Lock()
+	attempts := manager.restartAttempts
+	manager.mu.Unlock()
+	if attempts != len(manager.restartDelays) {
+		t.Fatalf("persisted restart attempts = %d, want %d", attempts, len(manager.restartDelays))
+	}
+
+	invocations, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs := strings.Count(string(invocations), "run\x1f"); runs != 6 {
+		t.Fatalf("helper ran %d times, want initial run plus exactly 5 restarts: %q", runs, invocations)
+	}
+	joinedLogs := strings.Join(manager.Snapshot().Logs, "\n")
+	for _, delay := range manager.restartDelays {
+		if !strings.Contains(joinedLogs, "等待 "+delay.String()) {
+			t.Fatalf("restart log does not show delay %s:\n%s", delay, joinedLogs)
+		}
+	}
+	for attempt := 1; attempt <= len(manager.restartDelays); attempt++ {
+		label := fmt.Sprintf("sing-box 自动重启成功 (%d/%d)", attempt, len(manager.restartDelays))
+		if !strings.Contains(joinedLogs, label) {
+			t.Fatalf("restart log does not show %q:\n%s", label, joinedLogs)
+		}
+	}
+
+	stableConfig := json.RawMessage(`{"password":"restart-secret","stable":true}`)
+	if err := manager.Apply(config.Engine{Enabled: true, Config: stableConfig}); err != nil {
+		t.Fatalf("reapplying a valid config should recover an exhausted engine: %v", err)
+	}
+	snapshot := manager.Snapshot()
+	manager.mu.Lock()
+	attempts = manager.restartAttempts
+	manager.mu.Unlock()
+	if !snapshot.Running || snapshot.Error != "" || attempts != 0 {
+		t.Fatalf("successful reapply did not reset restart budget: state=%+v attempts=%d", snapshot, attempts)
+	}
+}
+
+func TestRestartBudgetResetsOnlyAfterStableWindow(t *testing.T) {
+	dir := t.TempDir()
+	manager, _ := helperManager(t, dir)
+	manager.startupGrace = 10 * time.Millisecond
+	manager.stableRunWindow = time.Second
+	manager.restartDelays = []time.Duration{20 * time.Millisecond}
+
+	engineConfig := json.RawMessage(`{
+		"password":"restart-secret",
+		"crash_once":true,
+		"crash_after_ms":20
+	}`)
+	if err := manager.Apply(config.Engine{Enabled: true, Config: engineConfig}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return manager.restartAttempts == 1
+	})
+	manager.mu.Lock()
+	attemptsBeforeStable := manager.restartAttempts
+	manager.mu.Unlock()
+	if attemptsBeforeStable != 1 {
+		t.Fatalf("restart budget reset before the stable window: %d", attemptsBeforeStable)
+	}
+
+	waitForCondition(t, 3*time.Second, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return manager.restartAttempts == 0
+	})
+	if !strings.Contains(strings.Join(manager.Snapshot().Logs, "\n"), "自动重启预算已复位") {
+		t.Fatal("stable-window reset was not logged")
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition was not met before timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

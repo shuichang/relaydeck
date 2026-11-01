@@ -69,7 +69,7 @@ func New(opts Options) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "relaydeck", "version": s.opts.Version})
 	})
 	mux.HandleFunc("POST /api/login", s.login)
 	mux.Handle("/api/", s.protect(http.HandlerFunc(s.api)))
@@ -342,12 +342,16 @@ func (s *Server) putRules(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.cfg
+	next := old
+	next.Rules = b.Rules
+	if err := config.ValidateSize(next); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
 	if err := s.forward.Apply(b.Rules); err != nil {
 		fail(w, 409, err.Error())
 		return
 	}
-	next := old
-	next.Rules = b.Rules
 	if err := s.store.Save(next); err != nil {
 		rollbackRules := old.Rules
 		if s.forwardError != "" {
@@ -376,12 +380,16 @@ func (s *Server) putEngine(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.cfg
+	next := old
+	next.Engine = b
+	if err := config.ValidateSize(next); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
 	if err := s.engine.Apply(b); err != nil {
 		fail(w, 400, err.Error())
 		return
 	}
-	next := old
-	next.Engine = b
 	if err := s.store.Save(next); err != nil {
 		if rollback := s.engine.Apply(old.Engine); rollback != nil {
 			log.Printf("CRITICAL: engine rollback failed: %v", rollback)
