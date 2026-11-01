@@ -60,7 +60,9 @@ func runEngineHelper(args []string) int {
 			statePath := os.Getenv("RELAYDECK_ENGINE_HELPER_STATE")
 			if _, err := os.Stat(statePath); os.IsNotExist(err) {
 				_ = os.WriteFile(statePath, []byte("crashed\n"), 0600)
-				time.Sleep(800 * time.Millisecond)
+				// Exit after the manager's startup grace period so the process
+				// is registered first and exercises the unexpected-exit path.
+				time.Sleep(startupGracePeriod + 200*time.Millisecond)
 				return 3
 			}
 		}
@@ -97,7 +99,7 @@ func readHelperConfig(path string) (map[string]any, map[string]bool) {
 		return content, flags
 	}
 	_ = json.Unmarshal(raw, &content)
-	for _, key := range []string{"emit_secret", "reject_check", "fail_start"} {
+	for _, key := range []string{"emit_secret", "reject_check", "fail_start", "crash_once"} {
 		flags[key], _ = content[key].(bool)
 	}
 	return content, flags
@@ -249,13 +251,17 @@ func TestStartupFailureRestoresPreviousProcessAndConfig(t *testing.T) {
 
 func TestUnexpectedExitRestartsWithBackoff(t *testing.T) {
 	dir := t.TempDir()
-	manager, _ := helperManager(t, dir)
+	manager, record := helperManager(t, dir)
 	engineConfig := json.RawMessage(`{"password":"restart-secret","crash_once":true}`)
 	if err := manager.Apply(config.Engine{Enabled: true, Config: engineConfig}); err != nil {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(4 * time.Second)
+	// The first process must pass the 600ms startup grace, exit, wait through
+	// the 1s restart delay, and then survive a second 600ms startup grace.
+	// Ten seconds leaves ample scheduling margin on loaded CI runners while
+	// only bounding the test when the restart path actually stalls.
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		snapshot := manager.Snapshot()
 		joinedLogs := strings.Join(snapshot.Logs, "\n")
@@ -266,12 +272,37 @@ func TestUnexpectedExitRestartsWithBackoff(t *testing.T) {
 			if strings.Contains(joinedLogs, "restart-secret") {
 				t.Fatal("credential leaked during restart")
 			}
+			state, err := os.ReadFile(filepath.Join(dir, "helper-state"))
+			if err != nil || string(state) != "crashed\n" {
+				t.Fatalf("crash_once branch did not run: state=%q err=%v", state, err)
+			}
+			invocations, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runs := strings.Count(string(invocations), "run\x1f"); runs < 2 {
+				t.Fatalf("helper ran %d times, want at least 2: %q", runs, invocations)
+			}
 			return
 		}
 		if time.Now().After(deadline) {
+			invocations, _ := os.ReadFile(record)
+			state, _ := os.ReadFile(filepath.Join(dir, "helper-state"))
+			manager.mu.Lock()
+			process := manager.proc
+			manager.mu.Unlock()
+			exited := false
+			if process != nil {
+				select {
+				case <-process.exited:
+					exited = true
+				default:
+				}
+			}
+			t.Logf("invocations=%q state=%q processExited=%v", invocations, state, exited)
 			t.Fatalf("process did not recover after unexpected exit: %+v", snapshot)
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

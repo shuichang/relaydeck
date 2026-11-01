@@ -290,24 +290,18 @@
       ? status.forward
       : {};
     const rulesLoaded = state.rulesLoaded;
-    const totalRules = rulesLoaded
-      ? state.rules.length
-      : numberOrNull(forward.total_rules);
-    const totalRunning = rulesLoaded
-      ? state.rules.filter((rule) => rule.running).length
-      : numberOrNull(forward.active_rules);
-    const connections = rulesLoaded
-      ? sumRules("active_connections")
-      : numberOrNull(forward.active_connections);
-    const udpSessions = rulesLoaded
-      ? sumRules("udp_sessions")
-      : numberOrNull(forward.udp_sessions);
-    const bytesIn = rulesLoaded
-      ? sumRules("bytes_in")
-      : numberOrNull(forward.bytes_in);
-    const bytesOut = rulesLoaded
-      ? sumRules("bytes_out")
-      : numberOrNull(forward.bytes_out);
+    const totalRules = numberOrNull(forward.total_rules)
+      ?? (rulesLoaded ? state.rules.length : null);
+    const totalRunning = numberOrNull(forward.active_rules)
+      ?? (rulesLoaded ? state.rules.filter((rule) => rule.running).length : null);
+    const connections = numberOrNull(forward.active_connections)
+      ?? (rulesLoaded ? sumRules("active_connections") : null);
+    const udpSessions = numberOrNull(forward.udp_sessions)
+      ?? (rulesLoaded ? sumRules("udp_sessions") : null);
+    const bytesIn = numberOrNull(forward.bytes_in)
+      ?? (rulesLoaded ? sumRules("bytes_in") : null);
+    const bytesOut = numberOrNull(forward.bytes_out)
+      ?? (rulesLoaded ? sumRules("bytes_out") : null);
 
     setText("stat-rules", totalRules === null ? "—" : formatNumber(totalRules));
     setText("stat-running", totalRunning === null ? "—" : formatNumber(totalRunning));
@@ -316,7 +310,7 @@
     setText("stat-in", bytesIn === null ? "—" : formatBytes(bytesIn));
     setText("stat-out", bytesOut === null ? "—" : formatBytes(bytesOut));
 
-    if (rulesLoaded) {
+    if (totalRules !== null) {
       setText("stat-rules-note", totalRules === 0 ? "尚未配置转发规则" : "当前配置总数");
       setText(
         "stat-running-note",
@@ -480,7 +474,9 @@
     wrapper.append(createElement(
       "span",
       "",
-      rule.max_connections > 0 ? `连接上限 ${formatNumber(rule.max_connections)}` : "连接不额外限流",
+      rule.max_connections > 0
+        ? `连接上限 ${formatNumber(rule.max_connections)}`
+        : "连接上限默认 256",
     ));
     wrapper.append(createElement(
       "span",
@@ -740,11 +736,19 @@
       (cidr) => !/^[0-9A-Fa-f:.]+\/\d{1,3}$/.test(cidr),
     );
     if (invalidCIDR) return `CIDR“${invalidCIDR}”格式无效。`;
-    if (!Number.isInteger(rule.max_connections) || rule.max_connections < 0) {
-      return "最大连接数必须是 0 或正整数。";
+    if (
+      !Number.isInteger(rule.max_connections) ||
+      rule.max_connections < 0 ||
+      rule.max_connections > 4096
+    ) {
+      return "最大连接数必须在 0 到 4096 之间；0 表示采用默认值 256。";
     }
-    if (!Number.isInteger(rule.udp_timeout) || rule.udp_timeout < 1) {
-      return "UDP 空闲超时必须是正整数秒。";
+    if (
+      !Number.isInteger(rule.udp_timeout) ||
+      rule.udp_timeout < 1 ||
+      rule.udp_timeout > 86400
+    ) {
+      return "UDP 空闲超时必须在 1 到 86400 秒之间。";
     }
     return "";
   }
@@ -1059,9 +1063,10 @@
     hintError(elements.engineAlert, error);
   }
 
-  async function loadEngine({ silent = false } = {}) {
+  async function loadEngine({ silent = false, replaceEditor = false } = {}) {
     if (state.engineLoading || !state.authenticated) return false;
     state.engineLoading = true;
+    const firstLoad = !state.engineLoaded;
     try {
       const requests = [api("/api/engine")];
       if (!state.templatesLoaded) requests.push(api("/api/engine/templates"));
@@ -1082,7 +1087,7 @@
         state.templatesLoaded = true;
         renderTemplates();
       }
-      renderEngine(engine);
+      renderEngine(engine, { replaceEditor: firstLoad || replaceEditor });
       if (state.engineDirty && !silent) {
         showToast("已刷新运行状态，未保存的 JSON 配置已保留。", "success");
       }
@@ -1171,7 +1176,7 @@
           ? "内核配置已校验并启用。"
           : "内核配置已保存。",
       );
-      await loadEngine({ silent: true });
+      await loadEngine({ silent: true, replaceEditor: true });
     } catch (error) {
       hintError(elements.engineFormError, errorMessage(error));
       showToast(`内核保存失败：${errorMessage(error)}`, "error", 6500);
