@@ -1,0 +1,10 @@
+.tools/
+.secrets/
+dist/
+node_modules/
+*.exe
+*.test
+*.log
+coverage.out
+relaydeck.json
+relaydeck-data/
