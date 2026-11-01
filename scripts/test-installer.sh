@@ -7,6 +7,9 @@ installer="${script_dir}/install.sh"
 tmpdir="$(mktemp -d)"
 server_pid=""
 other_pid=""
+test_port=""
+last_curl_exit=0
+last_http_code=""
 
 cleanup() {
   if [[ -n "$server_pid" ]]; then
@@ -28,6 +31,30 @@ fail() {
 
 pass() {
   printf 'PASS: %s\n' "$*"
+}
+
+helper_diagnostics() {
+  local alive="no"
+  local port="${test_port:-unknown}"
+
+  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    alive="yes"
+  fi
+  printf 'DIAG: helper_alive=%s helper_pid=%s test_port=%s curl_exit=%s http_code=%s\n' \
+    "$alive" "${server_pid:-unknown}" "$port" "$last_curl_exit" "${last_http_code:-none}" >&2
+  if [[ -s "${tmpdir}/initial-health.json" ]]; then
+    printf 'DIAG: health_body=%q\n' "$(< "${tmpdir}/initial-health.json")" >&2
+  fi
+  if [[ -s "${tmpdir}/curl.stderr" ]]; then
+    printf 'DIAG: curl_stderr=%q\n' "$(< "${tmpdir}/curl.stderr")" >&2
+  fi
+  if [[ -s "${tmpdir}/test-helper.log" ]]; then
+    printf 'DIAG: helper_log:\n' >&2
+    sed -n '1,40p' "${tmpdir}/test-helper.log" >&2
+  fi
+  if [[ "$port" != "unknown" ]]; then
+    ss -H -ltnp "sport = :${port}" >&2 || true
+  fi
 }
 
 for cmd in awk curl go openssl sed ss tar; do
@@ -129,7 +156,12 @@ func serve(certPath, keyPath, portPath string) {
 		log.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, healthBody)
 	})
@@ -184,7 +216,8 @@ GO111MODULE=off go build -trimpath \
   -o "${tmpdir}/test-helper" "${tmpdir}/test-helper.go"
 
 "${tmpdir}/test-helper" serve \
-  "${tmpdir}/tls.crt" "${tmpdir}/tls.key" "${tmpdir}/port" &
+  "${tmpdir}/tls.crt" "${tmpdir}/tls.key" "${tmpdir}/port" \
+  2>"${tmpdir}/test-helper.log" &
 server_pid=$!
 
 for _ in {1..100}; do
@@ -192,22 +225,42 @@ for _ in {1..100}; do
   kill -0 "$server_pid" 2>/dev/null || fail "isolated HTTPS test server exited"
   sleep 0.05
 done
-[[ -s "${tmpdir}/port" ]] || fail "isolated HTTPS test server did not become ready"
+if [[ ! -s "${tmpdir}/port" ]]; then
+  helper_diagnostics
+  fail "isolated HTTPS test server did not become ready"
+fi
 test_port="$(< "${tmpdir}/port")"
 [[ "$test_port" =~ ^[0-9]+$ ]] || fail "isolated HTTPS test server returned an invalid port"
 [[ "$test_port" != "9443" ]] || fail "isolated test must never use port 9443"
 
+initial_ok=0
 for _ in {1..100}; do
-  if curl -kfsS --max-time 1 "https://localhost:${test_port}/healthz" \
-      --output "${tmpdir}/initial-health.json" 2>/dev/null; then
+  last_curl_exit=0
+  last_http_code="$(
+    curl -k --silent --show-error --max-time 1 --noproxy '*' \
+      --output "${tmpdir}/initial-health.json" \
+      --write-out '%{http_code}' \
+      "https://localhost:${test_port}/healthz" \
+      2>"${tmpdir}/curl.stderr"
+  )" || last_curl_exit=$?
+  # shellcheck disable=SC2310 # identity matching uses explicit returns
+  if ((last_curl_exit == 0)) && [[ "$last_http_code" == "200" ]] &&
+      relaydeck_health_identity_matches "$(< "${tmpdir}/initial-health.json")" v0.1.1; then
+    initial_ok=1
     break
   fi
   sleep 0.05
 done
-[[ -s "${tmpdir}/initial-health.json" ]] || fail "isolated HTTPS test server did not answer"
+if ((initial_ok == 0)); then
+  helper_diagnostics
+  fail "isolated HTTPS test server did not answer with the expected identity"
+fi
 
 relaydeck_port_owned_by_pid "$test_port" "$server_pid" \
-  || fail "listen socket should belong to the isolated HTTPS server"
+  || {
+    helper_diagnostics
+    fail "listen socket should belong to the isolated HTTPS server"
+  }
 pass "listen socket ownership matches the intended PID"
 
 sleep 30 &
@@ -222,7 +275,10 @@ pass "unrelated HTTPS service on the same port is rejected"
 
 test_main_pid="$server_pid"
 relaydeck_health_probe relaydeck.service "$test_port" v0.1.1 \
-  || fail "matching unit PID, listener, and health identity should pass"
+  || {
+    helper_diagnostics
+    fail "matching unit PID, listener, and health identity should pass"
+  }
 pass "MainPID, listener ownership, and service/version identity all match"
 
 # shellcheck disable=SC2310 # the probe returns explicitly and is expected to fail here
@@ -240,7 +296,10 @@ pass "inactive unit is rejected"
 
 test_active=1
 wait_for_relaydeck_health relaydeck.service "$test_port" v0.1.1 8 2 \
-  || fail "consecutive stable health probes should pass"
+  || {
+    helper_diagnostics
+    fail "consecutive stable health probes should pass"
+  }
 pass "health verification requires consecutive stable samples"
 
 test_main_pid="$other_pid"
