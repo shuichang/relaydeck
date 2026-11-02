@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.1
+  | bash -s -- --version v0.1.4
 ```
 
 首次安装会：
@@ -81,6 +81,14 @@ systemd 单元启用了文件系统、设备、内核、命名空间、系统调
 更多操作说明见 [docs/operations.md](docs/operations.md)。
 
 ## 可选 sing-box 内核
+
+在面板的“协议内核”页面点击“一键安装 sing-box”。面板会后台下载官方 `1.14.4`，显示下载、校验、解压及版本检测状态；失败时可以重试。安装成功后无需重启面板，填写模板中的远端参数，再点击“校验并保存”或勾选启用后点击“保存并启用”。模板中的示例参数需要替换为实际节点信息，安装本身不会启动模板。
+
+本次修复和审查记录见 [docs/core-install-2026-11-02.md](docs/core-install-2026-11-02.md)。
+
+面板安装目录为 `/var/lib/relaydeck/engines/sing-box`（自定义数据目录时为其下的 `engines/sing-box`）。系统 PATH 中的 sing-box 优先，缺少时自动发现私有内核；不会覆盖系统安装。支持 Linux amd64、arm64 和 armv7。使用 `--engine-binary` 自定义其他路径时，请自行安装到指定位置。下载需要服务器能够通过 HTTPS 访问 GitHub 官方 Release；下载归档和解压大小均有限制，并校验固定 SHA-256。
+
+无法从面板安装时，也可在 root 终端使用备用脚本：
 
 `scripts/install-sing-box.sh` 只安装固定版本 `1.14.4` 的官方 Linux 二进制到 `/usr/local/bin/sing-box`，不创建或修改 RelayDeck 配置与服务：
 

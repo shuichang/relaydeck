@@ -354,6 +354,40 @@
           </div>
 
           <div id="engine-alert" class="inline-alert error page-alert" role="alert" hidden></div>
+          <section id="engine-install-help" class="engine-install-help" aria-labelledby="engine-install-title" hidden>
+            <div class="engine-install-heading">
+              <span class="component-mark large"><svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg></span>
+              <div>
+                <strong id="engine-install-title">安装可选的 sing-box 内核</strong>
+                <p>点击下方按钮即可在本机完成安装，无需SSH、无需重启 RelayDeck 或服务器。安装期间可以继续编辑 JSON 草稿；安装完成后填写参数，并点击“保存并启用”。</p>
+              </div>
+            </div>
+            <div class="engine-install-primary">
+              <button id="engine-install" class="button primary" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
+                <span>一键安装 sing-box</span>
+              </button>
+              <p id="engine-install-status" class="engine-install-status" role="status" aria-live="polite">正在读取安装环境…</p>
+            </div>
+            <div class="engine-install-actions">
+              <button id="engine-recheck" class="button secondary" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                <span>刷新检测</span>
+              </button>
+              <span>安装不会自动启用或修改配置；保存前仍由内核校验 JSON。</span>
+            </div>
+            <details class="engine-install-manual">
+              <summary>手动安装（SSH 备用）</summary>
+              <p>仅在面板内安装不可用时使用。以 SSH root 身份运行命令，安装后回到此页刷新检测。</p>
+              <div class="engine-install-command-row">
+                <code id="engine-install-command" tabindex="0">curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install-sing-box.sh | bash</code>
+                <button id="engine-copy-install" class="button secondary" type="button">
+                  <svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg>
+                  <span>复制命令</span>
+                </button>
+              </div>
+            </details>
+          </section>
           <div class="engine-status-grid">
             <article class="engine-status-card">
               <span class="component-mark large"><svg class="icon" aria-hidden="true"><use href="#i-cpu"></use></svg></span>
@@ -390,11 +424,14 @@
               </label>
               <div id="engine-form-error" class="inline-alert error" role="alert" hidden></div>
               <div class="editor-actions">
-                <label class="switch-row">
-                  <input id="engine-enabled" type="checkbox">
-                  <span class="switch" aria-hidden="true"></span>
-                  <span>配置保存后启用内核</span>
-                </label>
+                <div class="engine-enable-control">
+                  <label class="switch-row">
+                    <input id="engine-enabled" type="checkbox">
+                    <span class="switch" aria-hidden="true"></span>
+                    <span>配置保存后启用内核</span>
+                  </label>
+                  <small>勾选不会立即启动；请再点击保存按钮完成校验与保存。</small>
+                </div>
                 <div class="button-row">
                   <button id="engine-stop" class="button danger-ghost" type="button">
                     <svg class="icon" aria-hidden="true"><use href="#i-power"></use></svg>
@@ -402,7 +439,7 @@
                   </button>
                   <button id="engine-save" class="button primary" type="button">
                     <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
-                    <span>保存配置</span>
+                    <span>校验并保存</span>
                   </button>
                 </div>
               </div>
@@ -420,7 +457,7 @@
                 <svg class="icon" aria-hidden="true"><use href="#i-alert"></use></svg>
                 <div>
                   <strong>安装与网络前置条件</strong>
-                  <p>sing-box 不随 RelayDeck 默认安装，接口会校验 <code>/usr/local/bin/sing-box</code>。UDP 转发依赖系统的透明代理、TUN 或防火墙规则，并受主机网络栈与应用回包方式限制；部分 UDP 服务可能无法通过。</p>
+                  <p>sing-box 不随 RelayDeck 默认安装，可在本页一键安装到应用数据目录。普通 TCP/UDP 转发无需协议内核或 TUN；通过模板启用出站隧道时，UDP 是否可用取决于模板和远端。</p>
                 </div>
               </article>
             </aside>
@@ -454,7 +491,7 @@
             <article class="help-card">
               <span class="help-number">04</span>
               <h3>协议内核</h3>
-              <p>内核页用于编辑 sing-box 配置。未安装 sing-box 时不能保存或启动；配置校验和进程启动均成功后才持久化。日志与版本来自后端状态接口。</p>
+              <p>内核页可一键安装 sing-box，也可在不受支持的环境中展开 SSH 手动安装。未安装时不能保存或启用；配置校验和进程启动均成功后才持久化。</p>
             </article>
             <article class="help-card">
               <span class="help-number">05</span>

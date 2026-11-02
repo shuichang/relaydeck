@@ -89,7 +89,7 @@ jobs:
       - name: Real protocol integration
         run: |
           sudo bash scripts/install-sing-box.sh
-          RELAYDECK_SING_BOX=/usr/local/bin/sing-box go test -count=1 -v ./internal/integration
+          RELAYDECK_SING_BOX=/usr/local/bin/sing-box RELAYDECK_TEST_DOWNLOAD=1 go test -count=1 -v ./internal/integration
           SING_BOX_BINARY=/usr/local/bin/sing-box go test -count=1 -run TestTemplatesWithOfficialSingBox ./internal/engine
 
   build:

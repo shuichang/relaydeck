@@ -11,7 +11,8 @@
 | 认证与运行数据 | `/var/lib/relaydeck` |
 | TLS 与配置 | `/etc/relaydeck` |
 | 管理监听 | `:9443`（HTTPS） |
-| 可选内核 | `/usr/local/bin/sing-box` |
+| 面板安装的可选内核 | `/var/lib/relaydeck/engines/sing-box` |
+| 手动安装的可选内核 | 系统 PATH，例如 `/usr/local/bin/sing-box`（优先） |
 
 认证文件是 `/var/lib/relaydeck/auth.json`，目录权限为 `0700`，文件权限为 `0600`。文件中保存用户名、随机盐和加盐哈希，不保存明文密码。安装器不把管理员密码写入配置文件、命令行参数、systemd 日志或仓库。首次安装成功时，随机密码只在 root 终端显示一次。
 
@@ -29,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.2
+  | bash -s -- --version v0.1.4
 ```
 
 首次创建证书时，默认优先读取本机路由及网卡上的公网 IPv4，再读取公网 IPv6；没有合适的本机地址时，按 IPv4/IPv6 使用多个 HTTPS 检测接口。外部请求有连接及总时限、绕过代理环境变量，并验证返回的确实是可用 IP 候选；单个接口失败不会直接中止安装。自动识别失败不表示服务器没有公网 IP。NAT、双线或多出口环境可显式指定入口 IP：
@@ -106,6 +107,10 @@ sudo systemctl restart relaydeck
 `certificate` 默认有效期是 365 天，可用 `--days` 指定 1–3650 天。应在到期前安排轮换；更新程序不会自动续期自签证书。
 
 ## 日常检查
+
+新机器缺少协议内核时，进入“协议内核”页面点击“一键安装 sing-box”，等待安装完成，再填写模板参数并保存启用。安装失败会显示原因并允许重试；无需 SSH 或重启面板。下载仅使用固定的官方 HTTPS Release 和项目内固定的 SHA-256。后台安装最多一个任务，关闭面板服务会取消安装并清理本次临时文件。
+
+面板只向数据目录中的 `engines` 写入内核，符合现有 systemd `ReadWritePaths` 限制。已有系统内核或指定了其他 `--engine-binary` 路径时，不执行覆盖或更新。安装成功不会自动保存或启用配置。若安装完成后仍无法启用，检查 JSON 中的示例地址、认证、证书及端口，并查看页面上的校验错误和运行状态。
 
 ```bash
 sudo systemctl status relaydeck --no-pager

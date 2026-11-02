@@ -116,6 +116,56 @@ async function waitTarget(page, text) {
   );
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function enginePayload(overrides = {}) {
+  return {
+    enabled: false,
+    available: true,
+    running: false,
+    version: 'sing-box version 1.14.4',
+    error: '',
+    config: { log: { level: 'info' } },
+    logs: [],
+    installation: installationPayload(),
+    ...overrides,
+  };
+}
+
+function installationPayload(overrides = {}) {
+  return {
+    supported: true,
+    version: '1.14.4',
+    phase: 'idle',
+    running: false,
+    downloaded_bytes: 0,
+    total_bytes: 0,
+    error: '',
+    ...overrides,
+  };
+}
+
+async function settleFrames(page) {
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+}
+
+async function checkEngineEnabled(page) {
+  const checkbox = page.locator('#engine-enabled');
+  if (!(await checkbox.isChecked())) {
+    await page.getByText('配置保存后启用内核', { exact: true }).click();
+  }
+}
+
 async function stopOwnedPreview() {
   const child = preview;
   preview = undefined;
@@ -389,15 +439,358 @@ async function run() {
   await page.locator('[data-route="engine"]').click();
   await page.waitForFunction(() => document.querySelectorAll('#engine-template option').length === 11);
   assert.equal(await page.locator('#engine-template option').nth(1).getAttribute('value'), 'direct-passthrough');
+
+  // A: the real isolated preview has no engine binary. Exercise the native
+  // unavailable state before installing controlled API fixtures.
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin });
+  await page.waitForFunction(() => document.getElementById('engine-available').textContent.includes('未安装'));
+  await page.locator('#engine-install-help').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#engine-install-help').isVisible(), true);
+  await page.locator('.engine-install-manual summary').click();
+  await page.locator('#engine-install-command').waitFor({ state: 'visible' });
+  const installCommand = (await page.locator('#engine-install-command').textContent()).trim();
+  assert.match(installCommand, /curl\s+-fsSL/);
+  assert.match(installCommand, /install-sing-box\.sh/);
+  assert.match(installCommand, /\|\s*(?:sudo\s+)?bash/);
+  assert.equal(await page.locator('#engine-enabled').isDisabled(), true);
+  assert.equal(await page.locator('#engine-save').isDisabled(), true);
+  await page.locator('#engine-template').selectOption('direct-passthrough');
+  assert.equal(await page.locator('#engine-apply-template').isDisabled(), false);
+  const nativeRecheck = page.waitForRequest(request =>
+    request.method() === 'GET' && new URL(request.url()).pathname === '/api/engine',
+  );
+  await page.locator('#engine-recheck').click();
+  await nativeRecheck;
+  await page.waitForFunction(() => document.getElementById('engine-available').textContent.includes('未安装'));
+  await page.locator('#engine-copy-install').click();
+  await page.waitForFunction(async expected => {
+    try {
+      return (await navigator.clipboard.readText()).trim() === expected;
+    } catch {
+      return false;
+    }
+  }, installCommand);
+  report.engineMissingKernelGuide = 'passed';
+
+  let controlledEngine = enginePayload();
+  let nextEngineGet;
+  let nextEnginePut;
+  let nextEngineInstall;
+  const fulfillEngine = (route, payload) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(payload),
+  });
+  const fulfillInstallation = (route, installation) => route.fulfill({
+    status: 202,
+    contentType: 'application/json',
+    body: JSON.stringify(installation),
+  });
+  await page.route('**/api/engine', async route => {
+    const request = route.request();
+    if (request.method() === 'GET') {
+      if (nextEngineGet) {
+        const handler = nextEngineGet;
+        nextEngineGet = undefined;
+        await handler(route);
+        return;
+      }
+      await fulfillEngine(route, controlledEngine);
+      return;
+    }
+    if (request.method() === 'PUT') {
+      const body = request.postDataJSON();
+      if (nextEnginePut) {
+        const handler = nextEnginePut;
+        nextEnginePut = undefined;
+        await handler(route, body);
+        return;
+      }
+      controlledEngine = enginePayload({
+        enabled: Boolean(body.enabled),
+        running: Boolean(body.enabled),
+        config: body.config,
+      });
+      await fulfillEngine(route, controlledEngine);
+      return;
+    }
+    await route.continue();
+  });
+  await page.route('**/api/engine/install', async route => {
+    if (route.request().method() !== 'POST') return route.continue();
+    const body = route.request().postDataJSON();
+    if (nextEngineInstall) {
+      const handler = nextEngineInstall;
+      nextEngineInstall = undefined;
+      await handler(route, body);
+      return;
+    }
+    await fulfillInstallation(route, installationPayload());
+  });
+
+  async function refreshControlledEngine(expectedStatus) {
+    const response = page.waitForResponse(candidate =>
+      candidate.request().method() === 'GET' && new URL(candidate.url()).pathname === '/api/engine',
+    );
+    await page.locator('#engine-recheck:visible, #engine-refresh:visible').first().click();
+    await response;
+    await settleFrames(page);
+    if (expectedStatus) {
+      await page.waitForFunction(
+        expected => document.getElementById('engine-available').textContent.includes(expected),
+        expectedStatus,
+      );
+    }
+  }
+
+  // One-click install: the first mocked POST fails and must become retryable.
+  // The retry returns 202 in checking state, then the next GET publishes the
+  // completed installation without downloading a real binary.
+  controlledEngine = enginePayload({
+    available: false,
+    version: '',
+    config: {},
+    installation: installationPayload(),
+  });
+  await refreshControlledEngine('未安装');
+  const installDraft = JSON.stringify({
+    installDraft: { preserve: true },
+    log: { level: 'debug' },
+  }, null, 2);
+  await page.locator('#engine-config').fill(installDraft);
+  assert.equal(await page.locator('#engine-save').isDisabled(), true);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await delay(300);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  await page.screenshot({ path: artifactPath('engine-install-mobile.png'), fullPage: true, animations: 'disabled' });
+  report.engineMobileOverflow = false;
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  await delay(300);
+  await page.screenshot({ path: artifactPath('engine-install-desktop.png'), fullPage: true, animations: 'disabled' });
+  const installButton = page.getByRole('button', { name: /安装|重试/ }).first();
+  await installButton.waitFor({ state: 'visible' });
+
+  const firstInstallStarted = deferred();
+  nextEngineInstall = async (route, body) => {
+    firstInstallStarted.resolve(body);
+    const failed = installationPayload({
+      phase: 'failed',
+      running: false,
+      error: 'fixture install failure',
+    });
+    controlledEngine = enginePayload({
+      available: false,
+      version: '',
+      config: {},
+      installation: failed,
+    });
+    await fulfillInstallation(route, failed);
+  };
+  await installButton.click();
+  assert.deepEqual(await firstInstallStarted.promise, {});
+  await page.getByText('fixture install failure', { exact: false }).first().waitFor({ state: 'visible' });
+  await installButton.waitFor({ state: 'visible' });
+  assert.equal(await installButton.isDisabled(), false);
+
+  const secondInstallStarted = deferred();
+  const releaseSecondInstall = deferred();
+  nextEngineInstall = async (route, body) => {
+    secondInstallStarted.resolve(body);
+    await releaseSecondInstall.promise;
+    const total = 32 * 1024 * 1024;
+    controlledEngine = enginePayload({
+      available: true,
+      version: 'sing-box version 1.14.4',
+      config: {},
+      installation: installationPayload({
+        phase: 'complete',
+        running: false,
+        downloaded_bytes: total,
+        total_bytes: total,
+      }),
+    });
+    await fulfillInstallation(route, installationPayload({
+      phase: 'checking',
+      running: true,
+      downloaded_bytes: total,
+      total_bytes: total,
+    }));
+  };
+  await installButton.click();
+  assert.deepEqual(await secondInstallStarted.promise, {});
+  report.engineInstallFailureRetry = 'passed';
+  releaseSecondInstall.resolve();
+  await page.waitForFunction(() => document.getElementById('engine-available').textContent.includes('已安装'));
+  await settleFrames(page);
+  assert.equal(await page.locator('#engine-config').inputValue(), installDraft);
+  assert.equal(await page.locator('#engine-enabled').isDisabled(), false);
+  assert.equal(await page.locator('#engine-save').isDisabled(), false);
+  assert.equal(await page.locator('#engine-template').isDisabled(), false);
+  report.engineInstallCompletion = 'passed';
+
+  // Preserve the existing template application coverage under the newly
+  // available state. A already asserted the real missing-engine contract.
+  controlledEngine = enginePayload();
+  await refreshControlledEngine('已安装');
   await page.locator('#engine-template').selectOption('direct-passthrough');
   await page.locator('#engine-apply-template').click();
+  await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+  await page.locator('#confirm-action').click();
   const generic = JSON.parse(await page.locator('#engine-config').inputValue());
   assert.equal(generic.outbounds[0].type, 'direct');
   assert.equal(generic.inbounds[0].network, undefined);
   assert.match(await page.locator('.template-guidance').textContent(), /无需协议内核/);
   report.templates = 10;
 
+  // B: a manual recheck moves the fixture from unavailable to available. The
+  // editor draft must survive and save/enable controls must unlock.
+  controlledEngine = enginePayload({ available: false, version: '', config: {} });
+  await refreshControlledEngine('未安装');
+  const bDraft = JSON.stringify({ bDraft: { transport: 'both' }, log: { level: 'debug' } }, null, 2);
+  await page.locator('#engine-config').fill(bDraft);
+  assert.equal(await page.locator('#engine-enabled').isDisabled(), true);
+  assert.equal(await page.locator('#engine-save').isDisabled(), true);
+  controlledEngine = enginePayload({ available: true, config: {} });
+  await refreshControlledEngine('已安装');
+  assert.equal(await page.locator('#engine-config').inputValue(), bDraft);
+  assert.equal(await page.locator('#engine-enabled').isDisabled(), false);
+  assert.equal(await page.locator('#engine-save').isDisabled(), false);
+  assert.equal(await page.locator('#engine-recheck').isDisabled(), false);
+  report.engineAvailableRecheck = 'passed';
+
+  // C: repeated poll-shaped enabled=false responses cannot reset a dirty draft
+  // or the user's unsaved enable choice.
+  controlledEngine = enginePayload({ enabled: false, available: true });
+  await refreshControlledEngine('已安装');
+  const cDraft = JSON.stringify({ cDraft: { route: 'direct' }, log: { level: 'warn' } }, null, 2);
+  await page.locator('#engine-config').fill(cDraft);
+  await checkEngineEnabled(page);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await refreshControlledEngine('已安装');
+    assert.equal(await page.locator('#engine-config').inputValue(), cDraft);
+    assert.equal(await page.locator('#engine-enabled').isChecked(), true);
+  }
+  assert.match(await page.locator('#engine-save').textContent(), /保存并启用/);
+  report.engineRefreshPreservesDraft = 'passed';
+
+  // D: capture the exact save payload, hold the PUT open to observe disabled
+  // controls, then prove the running response is rendered by the UI.
+  const dDraft = JSON.stringify({ dDraft: { mode: 'udp' }, log: { level: 'debug' } }, null, 2);
+  await page.locator('#engine-config').fill(dDraft);
+  await checkEngineEnabled(page);
+  const saveStarted = deferred();
+  const releaseSave = deferred();
+  const saveFinished = deferred();
+  nextEnginePut = async (route, body) => {
+    saveStarted.resolve(body);
+    await releaseSave.promise;
+    controlledEngine = enginePayload({
+      enabled: true,
+      running: true,
+      config: body.config,
+    });
+    await fulfillEngine(route, controlledEngine);
+    saveFinished.resolve();
+  };
+  await page.locator('#engine-save').click();
+  const saveBody = await saveStarted.promise;
+  assert.equal(saveBody.enabled, true);
+  assert.deepEqual(saveBody.config, JSON.parse(dDraft));
+  assert.equal(await page.locator('#engine-save').isDisabled(), true);
+  assert.equal(await page.locator('#engine-enabled').isDisabled(), true);
+  assert.equal(await page.locator('#engine-config').isDisabled(), true);
+  assert.equal(await page.locator('#engine-apply-template').isDisabled(), true);
+  assert.equal(await page.locator('#engine-template').isDisabled(), true);
+  releaseSave.resolve();
+  await saveFinished.promise;
+  await page.waitForFunction(() => document.getElementById('engine-running').textContent.includes('运行中'));
+  assert.equal(await page.locator('#engine-enabled').isChecked(), true);
+  report.engineSaveRequestAndRunning = 'passed';
+
+  // E: save while an older GET is still pending, then release enabled=false.
+  // The completed PUT must win and the stale GET must not roll the UI back.
+  const eSaved = { eSaved: { mode: 'running' }, log: { level: 'info' } };
+  controlledEngine = enginePayload({ enabled: true, running: true, config: eSaved });
+  await refreshControlledEngine('已安装');
+  await page.waitForFunction(() => document.getElementById('engine-running').textContent.includes('运行中'));
+  const eDraft = JSON.stringify({ eDraft: { mode: 'latest' }, log: { level: 'error' } }, null, 2);
+  await page.locator('#engine-config').fill(eDraft);
+  await checkEngineEnabled(page);
+  const staleStarted = deferred();
+  const releaseStale = deferred();
+  const staleFinished = deferred();
+  nextEngineGet = async route => {
+    staleStarted.resolve();
+    await releaseStale.promise;
+    await fulfillEngine(route, enginePayload({
+      enabled: false,
+      running: false,
+      config: eSaved,
+    }));
+    staleFinished.resolve();
+  };
+  await page.locator('#engine-recheck:visible, #engine-refresh:visible').first().click();
+  await staleStarted.promise;
+  const staleSaveFinished = deferred();
+  nextEnginePut = async (route, body) => {
+    controlledEngine = enginePayload({
+      enabled: true,
+      running: true,
+      config: body.config,
+    });
+    await fulfillEngine(route, controlledEngine);
+    staleSaveFinished.resolve(body);
+  };
+  await page.locator('#engine-save').click();
+  const staleSaveBody = await staleSaveFinished.promise;
+  assert.equal(staleSaveBody.enabled, true);
+  await page.waitForFunction(() => document.getElementById('engine-running').textContent.includes('运行中'));
+  releaseStale.resolve();
+  await staleFinished.promise;
+  await settleFrames(page);
+  assert.equal(await page.locator('#engine-config').inputValue(), eDraft);
+  assert.equal(await page.locator('#engine-enabled').isChecked(), true);
+  assert.doesNotMatch(await page.locator('#engine-running').textContent(), /已停用/);
+  report.engineStaleGetOrdering = 'passed';
+
+  // F: stopping must use the last saved backend config, not the unsaved editor
+  // draft, while the unsaved JSON remains in the form.
+  const fSaved = { fSaved: { mode: 'saved' }, log: { level: 'info' } };
+  controlledEngine = enginePayload({ enabled: true, running: true, config: fSaved });
+  await refreshControlledEngine('已安装');
+  await page.waitForFunction(() => document.getElementById('engine-running').textContent.includes('运行中'));
+  const fDraft = JSON.stringify({ fDraft: { mode: 'unsaved' }, log: { level: 'error' } }, null, 2);
+  await page.locator('#engine-config').fill(fDraft);
+  await page.locator('#engine-dirty').waitFor({ state: 'visible' });
+  const stopStarted = deferred();
+  const stopFinished = deferred();
+  nextEnginePut = async (route, body) => {
+    stopStarted.resolve(body);
+    controlledEngine = enginePayload({
+      enabled: false,
+      running: false,
+      config: body.config,
+    });
+    await fulfillEngine(route, controlledEngine);
+    stopFinished.resolve();
+  };
+  await page.locator('#engine-stop').click();
+  await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+  await page.locator('#confirm-action').click();
+  const stopBody = await stopStarted.promise;
+  assert.equal(stopBody.enabled, false);
+  assert.deepEqual(stopBody.config, fSaved);
+  await stopFinished.promise;
+  await page.waitForFunction(() => document.getElementById('engine-running').textContent.includes('已停用'));
+  assert.equal(await page.locator('#engine-config').inputValue(), fDraft);
+  assert.equal(await page.locator('#engine-enabled').isChecked(), false);
+  await page.locator('#engine-dirty').waitFor({ state: 'visible' });
+  report.engineStopUsesSavedConfig = 'passed';
+
   await page.locator('[data-route="rules"]').click();
+  await page.unroute('**/api/engine/install');
+  await page.unroute('**/api/engine');
+
   // Exercise the new upper bound through the real form and persistence API.
   await page.locator('#rules-body button[aria-label="编辑规则"]').first().click();
   await delay(80);

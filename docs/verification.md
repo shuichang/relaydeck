@@ -21,6 +21,15 @@ sudo bash scripts/install-sing-box.sh
 RELAYDECK_SING_BOX=/usr/local/bin/sing-box go test -count=1 -v ./internal/integration
 ```
 
+真实面板一键下载与启用测试可显式开启（需要 Linux 和 GitHub HTTPS 连接）：
+
+```bash
+RELAYDECK_SING_BOX=/usr/local/bin/sing-box RELAYDECK_TEST_DOWNLOAD=1 \
+  go test -count=1 -v ./internal/integration
+```
+
+该测试隐藏系统 PATH 中的内核来模拟新机器，经登录、CSRF 和同源 API 下载官方内核到临时数据目录，验证安装不会自动启用，然后保存模板、启用、通过真实 TCP/UDP 回显、停用及再次启用；不改动已有服务。CI 也执行该流程。
+
 测试创建临时 HTTP 目标、sing-box 客户端与服务端，并在中间接入 RelayDeck 原生转发器。VLESS、VLESS + Reality 使用 TCP，Hysteria2 使用 QUIC/UDP。每条链路分别验证 IPv4 与 IPv6 入口到 IPv4 服务端，并核对 HTTP 回显内容。Reality 使用本地 TLS 诱饵服务，Hysteria2 显式信任临时证书；不需要真实节点凭据。所有进程与临时监听在测试后关闭。
 
 CI 对分支 push、PR 和版本 tag 执行普通测试、竞态检测、静态检查、安装脚本检查与真实协议测试。通过后才为版本 tag 构建 amd64、arm64、armv7 安装包并发布 SHA-256 清单。
@@ -52,6 +61,8 @@ RELAYDECK_BINARY="$PWD/.tools/relaydeck-ui" node scripts/test-web.cjs
 - HTTPS 管理会话、CSRF、来源校验、登录限速、密码修改及会话撤销。
 - 启动时目标解析或端口绑定失败仍保留管理入口，显示待修复规则。
 - 可选内核配置检查、进程启停、崩溃恢复、启动失败回滚及日志脱敏。
+- 面板一键安装的登录/CSRF/来源保护、空对象请求限制、单任务与重复请求、SHA-256 拒绝篡改、失败重试、精确归档成员提取、重定向白名单、下载大小限制、退出取消和临时文件清理。
+- 模板草稿和启用勾选在状态轮询中保留，安装进度与失败重试、安装完成按钮解锁，以及旧响应不能覆盖较新的保存结果。
 - 内核跨进程周期的连续崩溃预算；稳定运行后重置退避状态。
 - 十份 sing-box 配置模板的 JSON 结构及内核兼容性。
 - 通用直连及 Reality/XUDP 模板经 IPv4/IPv6 入口承载普通 TCP 字节与 UDP 报文的真实回显。

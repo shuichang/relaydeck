@@ -245,6 +245,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, engine.Templates())
 	case "PUT /api/engine":
 		s.putEngine(w, r)
+	case "POST /api/engine/install":
+		s.installEngine(w, r)
 	case "GET /api/config/export":
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -255,6 +257,24 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	default:
 		fail(w, 404, "接口不存在")
 	}
+}
+
+func (s *Server) installEngine(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	var body map[string]json.RawMessage
+	if !decode(w, r, &body) {
+		return
+	}
+	if body == nil || len(body) != 0 {
+		fail(w, http.StatusBadRequest, "内核安装请求必须是空 JSON 对象")
+		return
+	}
+	state, err := s.engine.StartInstall()
+	if err != nil {
+		fail(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, state)
 }
 
 func (s *Server) status(w http.ResponseWriter) {

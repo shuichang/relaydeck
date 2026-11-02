@@ -38,13 +38,14 @@ var defaultRestartDelays = []time.Duration{
 
 // Snapshot is the engine state exposed by the HTTP API.
 type Snapshot struct {
-	Enabled   bool            `json:"enabled"`
-	Config    json.RawMessage `json:"config"`
-	Available bool            `json:"available"`
-	Running   bool            `json:"running"`
-	Version   string          `json:"version"`
-	Error     string          `json:"error"`
-	Logs      []string        `json:"logs"`
+	Enabled      bool            `json:"enabled"`
+	Config       json.RawMessage `json:"config"`
+	Available    bool            `json:"available"`
+	Running      bool            `json:"running"`
+	Version      string          `json:"version"`
+	Error        string          `json:"error"`
+	Logs         []string        `json:"logs"`
+	Installation Installation    `json:"installation"`
 }
 
 // Manager supervises one optional sing-box child process. It does not persist
@@ -72,6 +73,7 @@ type Manager struct {
 	closeOnce       sync.Once
 	closeCh         chan struct{}
 	logs            *logRing
+	installer       *installer
 
 	// Timing knobs are initialized for production and shortened by package
 	// tests. They are immutable after construction outside tests.
@@ -98,6 +100,9 @@ func New(dataDir, binary string) *Manager {
 	if strings.TrimSpace(dataDir) == "" {
 		dataDir = filepath.Join(os.TempDir(), "relaydeck-engine")
 	}
+	if absolute, err := filepath.Abs(dataDir); err == nil {
+		dataDir = absolute
+	}
 	manager := &Manager{
 		dataDir:         filepath.Clean(dataDir),
 		binarySpec:      binary,
@@ -107,6 +112,7 @@ func New(dataDir, binary string) *Manager {
 		stableRunWindow: stableRunWindow,
 		restartDelays:   append([]time.Duration(nil), defaultRestartDelays...),
 	}
+	manager.installer = newInstaller(manager)
 	_, _ = manager.ensureBinary(true)
 	return manager
 }
@@ -347,6 +353,7 @@ func (m *Manager) Snapshot() Snapshot {
 		snapshot.Config = cloneRawMessage(defaultEngineConfig)
 	}
 	snapshot.Logs = m.logs.snapshot()
+	snapshot.Installation = m.installer.snapshot()
 	return snapshot
 }
 
@@ -355,6 +362,7 @@ func (m *Manager) Snapshot() Snapshot {
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
 		close(m.closeCh)
+		m.installer.close()
 		m.opMu.Lock()
 		defer m.opMu.Unlock()
 
@@ -763,10 +771,36 @@ func (m *Manager) ensureBinary(force bool) (string, error) {
 }
 
 func (m *Manager) probeBinary() (string, string, error) {
-	path, err := exec.LookPath(m.binarySpec)
-	if err != nil {
-		return "", "", fmt.Errorf("未找到 sing-box 可执行文件 %q", m.binarySpec)
+	specs := []string{m.binarySpec}
+	if m.binarySpec == "sing-box" {
+		specs = append(specs, filepath.Join(m.dataDir, "engines", "sing-box"))
 	}
+	var probeErr error
+	for _, spec := range specs {
+		path, err := exec.LookPath(spec)
+		if err != nil {
+			continue
+		}
+		path, err = filepath.Abs(path)
+		if err != nil {
+			probeErr = errors.New("无法解析 sing-box 可执行文件路径")
+			continue
+		}
+		version, err := binaryVersion(path)
+		if err == nil {
+			return path, version, nil
+		}
+		if probeErr == nil {
+			probeErr = err
+		}
+	}
+	if probeErr != nil {
+		return "", "", probeErr
+	}
+	return "", "", fmt.Errorf("未找到 sing-box 可执行文件 %q", m.binarySpec)
+}
+
+func binaryVersion(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), versionTimeout)
 	defer cancel()
 
@@ -774,15 +808,15 @@ func (m *Manager) probeBinary() (string, string, error) {
 	cmd := exec.CommandContext(ctx, path, "version")
 	cmd.Stdout = output
 	cmd.Stderr = output
-	if err = cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return "", "", fmt.Errorf("读取 sing-box 版本超时（%s）", versionTimeout)
+			return "", fmt.Errorf("读取 sing-box 版本超时（%s）", versionTimeout)
 		}
 		detail := strings.TrimSpace(output.String())
 		if detail == "" {
 			detail = err.Error()
 		}
-		return "", "", fmt.Errorf("无法运行 sing-box: %s", redactText(detail, nil))
+		return "", fmt.Errorf("无法运行 sing-box: %s", redactText(detail, nil))
 	}
 	version := strings.TrimSpace(output.String())
 	if line, _, found := strings.Cut(version, "\n"); found {
@@ -791,7 +825,7 @@ func (m *Manager) probeBinary() (string, string, error) {
 	if version == "" {
 		version = "sing-box（版本输出为空）"
 	}
-	return path, version, nil
+	return version, nil
 }
 
 func (m *Manager) maybeProbeMissingBinary() {

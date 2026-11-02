@@ -13,6 +13,7 @@
   const SAFE_PROBE_STATUSES = new Set(["listening", "available", "reachable", "error", "unverified"]);
   const DEFAULT_MAX_CONNECTIONS = 8192;
   const MAX_CONNECTIONS = 65536;
+  const ENGINE_INSTALL_COMMAND = "curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install-sing-box.sh | bash";
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -46,6 +47,11 @@
     engineLoading: false,
     engineSaving: false,
     engineDirty: false,
+    engineInstallation: null,
+    engineInstallRequesting: false,
+    engineInstallRequestError: "",
+    engineRequestEpoch: 0,
+    engineRequestSequence: 0,
     templates: [],
     templatesLoaded: false,
     pollTimer: null,
@@ -113,6 +119,13 @@
     passwordSubmit: byId("password-submit"),
     passwordFormError: byId("password-form-error"),
     engineAlert: byId("engine-alert"),
+    engineInstallHelp: byId("engine-install-help"),
+    engineInstall: byId("engine-install"),
+    engineInstallStatus: byId("engine-install-status"),
+    engineInstallCommand: byId("engine-install-command"),
+    engineCopyInstall: byId("engine-copy-install"),
+    engineRecheck: byId("engine-recheck"),
+    engineRefresh: byId("engine-refresh"),
     engineFormError: byId("engine-form-error"),
     engineConfig: byId("engine-config"),
     engineEnabled: byId("engine-enabled"),
@@ -1614,6 +1627,171 @@
     elements.engineDirty.hidden = !dirty;
   }
 
+  function invalidateEngineRequests() {
+    state.engineRequestEpoch += 1;
+    state.engineRequestSequence += 1;
+    state.engineLoading = false;
+  }
+
+  function isCurrentEngineRequest(epoch, sequence) {
+    return state.authenticated &&
+      epoch === state.engineRequestEpoch &&
+      sequence === state.engineRequestSequence;
+  }
+
+  function normalizeEngineInstallation(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const validPhases = new Set([
+      "idle",
+      "downloading",
+      "verifying",
+      "extracting",
+      "checking",
+      "complete",
+      "failed",
+    ]);
+    const phase = validPhases.has(value.phase) ? value.phase : "idle";
+    return {
+      supported: value.supported === true,
+      version: typeof value.version === "string" && value.version ? value.version : "1.14.4",
+      phase,
+      running: value.running === true,
+      downloaded_bytes: Number.isFinite(Number(value.downloaded_bytes))
+        ? Math.max(0, Number(value.downloaded_bytes))
+        : 0,
+      total_bytes: Number.isFinite(Number(value.total_bytes))
+        ? Math.max(0, Number(value.total_bytes))
+        : 0,
+      error: typeof value.error === "string" ? value.error : "",
+    };
+  }
+
+  function installationIsActive(installation) {
+    if (!installation) return false;
+    return installation.running || [
+      "downloading",
+      "verifying",
+      "extracting",
+      "checking",
+    ].includes(installation.phase);
+  }
+
+  function installationByteProgress(installation) {
+    if (!installation || installation.downloaded_bytes <= 0) return "";
+    if (installation.total_bytes > 0) {
+      return `（${formatBytes(installation.downloaded_bytes)} / ${formatBytes(installation.total_bytes)}）`;
+    }
+    return `（已下载 ${formatBytes(installation.downloaded_bytes)}）`;
+  }
+
+  function renderEngineInstallation() {
+    const installation = state.engineInstallation;
+    const active = installationIsActive(installation);
+    const phase = installation ? installation.phase : "idle";
+    let message = "";
+
+    if (state.engineInstallRequestError) {
+      message = `安装请求失败：${state.engineInstallRequestError}`;
+    } else if (state.engineInstallRequesting) {
+      message = "正在提交安装任务并校验运行环境…";
+    } else if (!installation) {
+      message = "服务端未返回安装能力；可展开“手动安装（SSH 备用）”。";
+    } else if (!installation.supported) {
+      message = installation.error
+        || "当前系统架构或自定义内核路径不支持一键安装，可展开备用命令。";
+    } else if (phase === "downloading") {
+      message = `正在下载 sing-box ${installation.version}${installationByteProgress(installation)}…`;
+    } else if (phase === "verifying") {
+      message = `正在校验官方 Release 的 SHA-256${installationByteProgress(installation)}…`;
+    } else if (phase === "extracting") {
+      message = `校验通过，正在解压内核文件${installationByteProgress(installation)}…`;
+    } else if (phase === "checking") {
+      message = "正在检测 sing-box 版本信息和当前安装阶段…";
+    } else if (phase === "complete") {
+      message = `sing-box ${installation.version} 安装完成，正在等待内核状态刷新。`;
+    } else if (phase === "failed") {
+      message = `安装失败：${installation.error || "未知错误"}。可点击“重试安装 sing-box”。`;
+    } else if (active) {
+      message = "安装任务运行中…";
+    } else {
+      message = "准备就绪。点击“一键安装 sing-box”开始，无需 SSH 或重启。";
+    }
+
+    elements.engineInstallStatus.textContent = message;
+    elements.engineInstallStatus.dataset.phase = state.engineInstallRequestError ? "failed" : phase;
+    elements.engineInstallHelp.setAttribute("aria-busy", String(state.engineInstallRequesting || active));
+  }
+
+  function updateEngineControls() {
+    const available = Boolean(state.engine && state.engine.available);
+    const running = Boolean(state.engine && state.engine.running);
+    const saving = state.engineSaving;
+    const installation = state.engineInstallation;
+    const installActive = installationIsActive(installation);
+    const installRequesting = state.engineInstallRequesting;
+    const installSupported = Boolean(installation && installation.supported);
+    const missingReason = "sing-box 未安装，无法保存或启用。请先点击上方“一键安装 sing-box”，完成安装并填写参数后再保存。";
+    const saveLabel = $("span", elements.engineSave);
+    const installLabel = $("span", elements.engineInstall);
+
+    elements.engineEnabled.disabled = !available || saving;
+    elements.engineSave.disabled = !available || saving;
+    elements.engineStop.disabled = !running || saving;
+    elements.engineConfig.disabled = saving;
+    elements.engineTemplate.disabled = state.templates.length === 0 || saving;
+    elements.engineApplyTemplate.disabled = !elements.engineTemplate.value || saving;
+    elements.engineCopyInstall.disabled = saving;
+    elements.engineRecheck.disabled = saving || state.engineLoading;
+    elements.engineRefresh.disabled = saving || state.engineLoading;
+    elements.engineInstall.disabled = !installSupported || available || saving || installRequesting || installActive;
+
+    if (installLabel) {
+      if (installRequesting) {
+        installLabel.textContent = "正在启动安装…";
+      } else if (installActive) {
+        installLabel.textContent = "正在安装 sing-box…";
+      } else if (installation && installation.phase === "failed") {
+        installLabel.textContent = "重试安装 sing-box";
+      } else if (available) {
+        installLabel.textContent = "sing-box 已安装";
+      } else {
+        installLabel.textContent = "一键安装 sing-box";
+      }
+    }
+
+    if (saveLabel) {
+      if (saving) {
+        saveLabel.textContent = elements.engineEnabled.checked ? "校验并启用中…" : "校验并保存中…";
+      } else if (!state.engine) {
+        saveLabel.textContent = "读取内核状态…";
+      } else if (!available) {
+        saveLabel.textContent = "需先安装 sing-box";
+      } else {
+        saveLabel.textContent = elements.engineEnabled.checked ? "保存并启用" : "校验并保存";
+      }
+    }
+
+    elements.engineSave.title = saving
+      ? "正在校验并保存配置，请稍候。"
+      : !available
+        ? missingReason
+        : elements.engineEnabled.checked
+          ? "校验配置并保存为启用状态。勾选本身不会立即启动内核。"
+          : "校验并保存配置，保持当前停用状态。";
+    elements.engineEnabled.title = !available
+      ? missingReason
+      : "勾选仅表示保存后启用；需点击保存按钮才会校验并应用。";
+    elements.engineInstall.title = !installation
+      ? "服务端未返回安装能力，请使用折叠的手动安装作为备用。"
+      : !installSupported
+        ? "当前系统架构或自定义内核路径不支持一键安装，可展开备用命令。"
+        : available
+          ? "sing-box 已安装。"
+          : "通过面板下载、校验并安装 sing-box；不会自动启用或修改配置。";
+    elements.engineInstallHelp.hidden = !state.engine || available;
+    renderEngineInstallation();
+  }
+
   function renderTemplates() {
     const previous = elements.engineTemplate.value;
     elements.engineTemplate.replaceChildren();
@@ -1629,9 +1807,8 @@
     if (state.templates.some((template) => template.id === previous)) {
       elements.engineTemplate.value = previous;
     }
-    elements.engineApplyTemplate.disabled = !elements.engineTemplate.value;
     const empty = state.templates.length === 0;
-    elements.engineTemplate.disabled = empty || state.engineSaving;
+    updateEngineControls();
     if (empty) {
       elements.engineTemplateDescription.textContent = "当前服务没有提供内置模板，可直接编辑 JSON 配置。";
     }
@@ -1640,6 +1817,8 @@
   function renderEngine(engine, { replaceEditor = true } = {}) {
     state.engine = engine;
     state.engineLoaded = true;
+    state.engineInstallation = normalizeEngineInstallation(engine && engine.installation);
+    state.engineInstallRequestError = "";
     const available = Boolean(engine && engine.available);
     const running = Boolean(engine && engine.running);
     const enabled = Boolean(engine && engine.enabled);
@@ -1664,15 +1843,11 @@
       running ? "" : enabled ? "neutral" : "neutral",
     );
 
-    elements.engineEnabled.checked = enabled;
-    elements.engineEnabled.disabled = !available || state.engineSaving;
-    elements.engineSave.disabled = !available || state.engineSaving;
-    elements.engineStop.disabled = !running || state.engineSaving;
-    elements.engineConfig.disabled = state.engineSaving;
-    elements.engineApplyTemplate.disabled = !elements.engineTemplate.value || state.engineSaving;
-
-    if (replaceEditor && !state.engineDirty) {
-      elements.engineConfig.value = prettyJSON(engine && engine.config);
+    if (!state.engineDirty) {
+      elements.engineEnabled.checked = enabled;
+      if (replaceEditor) {
+        elements.engineConfig.value = prettyJSON(engine && engine.config);
+      }
     }
 
     let logs = [];
@@ -1688,16 +1863,28 @@
     }
     elements.engineLogs.textContent = logs.length > 0 ? logs.join("\n") : "暂无日志";
     hintError(elements.engineAlert, error);
+    updateEngineControls();
   }
 
   async function loadEngine({ silent = false, replaceEditor = false } = {}) {
-    if (state.engineLoading || !state.authenticated) return false;
+    if (
+      state.engineLoading ||
+      state.engineSaving ||
+      state.engineInstallRequesting ||
+      !state.authenticated
+    ) {
+      return false;
+    }
+    const requestEpoch = state.engineRequestEpoch;
+    const requestSequence = ++state.engineRequestSequence;
     state.engineLoading = true;
     const firstLoad = !state.engineLoaded;
+    updateEngineControls();
     try {
-      const requests = [api("/api/engine")];
-      if (!state.templatesLoaded) requests.push(api("/api/engine/templates"));
+      const requests = [api("/api/engine", { authRedirect: false })];
+      if (!state.templatesLoaded) requests.push(api("/api/engine/templates", { authRedirect: false }));
       const results = await Promise.allSettled(requests);
+      if (!isCurrentEngineRequest(requestEpoch, requestSequence)) return false;
       if (results[0].status === "rejected") throw results[0].reason;
       const engine = results[0].value;
       if (!engine || typeof engine !== "object") {
@@ -1716,17 +1903,28 @@
       }
       renderEngine(engine, { replaceEditor: firstLoad || replaceEditor });
       if (state.engineDirty && !silent) {
-        showToast("已刷新运行状态，未保存的 JSON 配置已保留。", "success");
+        showToast("已刷新运行状态，未保存的 JSON 配置与启用勾选已保留。", "success");
       }
       return true;
     } catch (error) {
-      if (!silent && !(error instanceof ApiError && error.status === 401)) {
+      if (isCurrentEngineRequest(requestEpoch, requestSequence) && error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
+      if (
+        isCurrentEngineRequest(requestEpoch, requestSequence) &&
+        !silent &&
+        !(error instanceof ApiError && error.status === 401)
+      ) {
         hintError(elements.engineAlert, errorMessage(error));
         showToast(errorMessage(error), "error");
       }
       return false;
     } finally {
-      state.engineLoading = false;
+      if (isCurrentEngineRequest(requestEpoch, requestSequence)) {
+        state.engineLoading = false;
+        updateEngineControls();
+      }
     }
   }
 
@@ -1740,7 +1938,7 @@
     elements.engineTemplateDescription.textContent = template
       ? template.description || "已选择模板，应用后可继续编辑。"
       : "选择模板后可继续编辑。";
-    elements.engineApplyTemplate.disabled = !template || state.engineSaving;
+    updateEngineControls();
   }
 
   async function applyTemplate() {
@@ -1758,7 +1956,13 @@
     elements.engineConfig.value = prettyJSON(template.config);
     setEngineDirty(true);
     hintError(elements.engineFormError, "");
-    showToast(`已载入模板“${template.name || template.id}”，保存后生效。`);
+    const templateName = template.name || template.id;
+    if (state.engine && state.engine.available) {
+      showToast(`已载入模板“${templateName}”，保存后生效。`);
+    } else {
+      showToast(`已载入模板“${templateName}”。sing-box 尚未安装，请先点击“一键安装 sing-box”，安装后再保存并启用。`, "error", 7000);
+    }
+    updateEngineControls();
   }
 
   function parseEngineConfig() {
@@ -1771,10 +1975,127 @@
     }
   }
 
+  function selectEngineInstallCommand() {
+    elements.engineInstallCommand.focus();
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(elements.engineInstallCommand);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  async function copyEngineInstallCommand() {
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(ENGINE_INSTALL_COMMAND);
+      showToast("安装命令已复制，请以 SSH root 身份粘贴运行。");
+      return;
+    } catch {
+      selectEngineInstallCommand();
+    }
+
+    let copied = false;
+    try {
+      copied = typeof document.execCommand === "function" && document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    if (copied) {
+      showToast("安装命令已复制，请以 SSH root 身份粘贴运行。");
+      return;
+    }
+    showToast("自动复制失败，安装命令已选中，请按 Ctrl+C 复制。", "error", 7000);
+  }
+
+  async function installEngine() {
+    const installation = state.engineInstallation;
+    if (
+      state.engineInstallRequesting ||
+      state.engineSaving ||
+      !state.engine ||
+      state.engine.available ||
+      !installation ||
+      !installation.supported ||
+      installationIsActive(installation)
+    ) {
+      return false;
+    }
+
+    state.engineInstallRequesting = true;
+    state.engineInstallRequestError = "";
+    invalidateEngineRequests();
+    const requestEpoch = state.engineRequestEpoch;
+    updateEngineControls();
+    try {
+      const status = await api("/api/engine/install", {
+        method: "POST",
+        authRedirect: false,
+        body: {},
+      });
+      if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+      const nextInstallation = normalizeEngineInstallation(status);
+      if (!nextInstallation) {
+        throw new ApiError("安装接口没有返回有效的任务状态。", 0);
+      }
+      state.engineInstallRequesting = false;
+      state.engineInstallation = nextInstallation;
+      updateEngineControls();
+      showToast(
+        nextInstallation.phase === "complete"
+          ? "sing-box 已安装，正在刷新内核状态。"
+          : "sing-box 安装任务已开始，可在当前页查看进度。",
+      );
+      await loadEngine({ silent: true });
+      return true;
+    } catch (error) {
+      if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+      if (error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
+      state.engineInstallRequesting = false;
+      const message = errorMessage(error);
+      if (error instanceof ApiError && error.status === 409) {
+        await loadEngine({ silent: true, replaceEditor: false });
+        if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+        if (state.engine && state.engine.available) {
+          showToast("检测到 sing-box 已安装，内核状态已刷新。");
+        } else {
+          state.engineInstallRequestError = message;
+          updateEngineControls();
+          showToast(`无法开始安装：${message}`, "error", 7000);
+        }
+        return false;
+      }
+      state.engineInstallRequestError = message;
+      if (state.engineInstallation) {
+        state.engineInstallation = {
+          ...state.engineInstallation,
+          phase: "failed",
+          running: false,
+          error: message,
+        };
+      }
+      updateEngineControls();
+      showToast(`sing-box 安装失败：${message}`, "error", 7000);
+      return false;
+    } finally {
+      if (requestEpoch === state.engineRequestEpoch) {
+        state.engineInstallRequesting = false;
+        updateEngineControls();
+      }
+    }
+  }
+
   async function saveEngine() {
     if (state.engineSaving || !state.engine) return;
     if (!state.engine.available) {
-      hintError(elements.engineFormError, "未检测到 sing-box，当前无法校验或保存内核配置。");
+      const message = "未检测到 sing-box，当前无法校验或保存内核配置。请先点击上方“一键安装 sing-box”，安装完成后填写参数并保存。";
+      hintError(elements.engineFormError, message);
+      showToast(message, "error", 7000);
       return;
     }
     let config;
@@ -1784,37 +2105,50 @@
       hintError(elements.engineFormError, error.message);
       return;
     }
+    const enabledAtClick = Boolean(elements.engineEnabled.checked);
     hintError(elements.engineFormError, "");
     state.engineSaving = true;
-    elements.engineSave.disabled = true;
-    const saveLabel = $("span", elements.engineSave);
-    if (saveLabel) saveLabel.textContent = "校验并保存中…";
+    invalidateEngineRequests();
+    const requestEpoch = state.engineRequestEpoch;
+    updateEngineControls();
     try {
-      await api("/api/engine", {
+      const updated = await api("/api/engine", {
         method: "PUT",
+        authRedirect: false,
         body: {
-          enabled: elements.engineEnabled.checked,
+          enabled: enabledAtClick,
           config,
         },
       });
+      if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+      if (!updated || typeof updated !== "object" || Array.isArray(updated)) {
+        throw new ApiError("内核接口没有返回有效状态，请刷新页面确认保存结果。", 0);
+      }
       setEngineDirty(false);
+      renderEngine(updated, { replaceEditor: true });
       showToast(
-        elements.engineEnabled.checked
-          ? "内核配置已校验并启用。"
-          : "内核配置已保存。",
+        enabledAtClick
+          ? updated.running
+            ? "内核配置已校验并启用。"
+            : "配置已保存为启用状态，但内核未运行，请查看运行状态和日志。"
+          : "内核配置已校验并保存，保持停用状态。",
+        enabledAtClick && !updated.running ? "error" : "success",
       );
-      await loadEngine({ silent: true, replaceEditor: true });
+      return true;
     } catch (error) {
+      if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+      if (error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
       hintError(elements.engineFormError, errorMessage(error));
       showToast(`内核保存失败：${errorMessage(error)}`, "error", 6500);
+      return false;
     } finally {
-      state.engineSaving = false;
-      elements.engineSave.disabled = !state.engine || !state.engine.available;
-      elements.engineEnabled.disabled = !state.engine || !state.engine.available;
-      elements.engineConfig.disabled = false;
-      elements.engineApplyTemplate.disabled = !elements.engineTemplate.value;
-      if (state.engine) elements.engineStop.disabled = !state.engine.running;
-      if (saveLabel) saveLabel.textContent = "保存配置";
+      if (requestEpoch === state.engineRequestEpoch) {
+        state.engineSaving = false;
+        updateEngineControls();
+      }
     }
   }
 
@@ -1935,6 +2269,11 @@
 
   function showLogin(message = "") {
     state.authenticated = false;
+    invalidateEngineRequests();
+    state.engineSaving = false;
+    state.engineInstallRequesting = false;
+    state.engineInstallation = null;
+    state.engineInstallRequestError = "";
     state.ruleProbeLatest.clear();
     state.ruleProbeResults.clear();
     state.ruleProbePending.clear();
@@ -1960,6 +2299,12 @@
     state.rulesLoaded = false;
     state.rules = [];
     state.engineLoaded = false;
+    state.engine = null;
+    state.engineDirty = false;
+    state.engineInstallation = null;
+    state.engineInstallRequesting = false;
+    state.engineInstallRequestError = "";
+    elements.engineDirty.hidden = true;
     state.templatesLoaded = false;
     elements.loginView.hidden = true;
     elements.appView.hidden = false;
@@ -2055,7 +2400,10 @@
       button.disabled = false;
     });
     byId("rules-refresh").addEventListener("click", () => loadRules());
-    byId("engine-refresh").addEventListener("click", () => loadEngine());
+    elements.engineRefresh.addEventListener("click", () => loadEngine());
+    elements.engineRecheck.addEventListener("click", () => loadEngine());
+    elements.engineInstall.addEventListener("click", installEngine);
+    elements.engineCopyInstall.addEventListener("click", copyEngineInstallCommand);
 
     elements.ruleSearch.addEventListener("input", renderRules);
     byId("rules-export").addEventListener("click", exportConfig);
@@ -2093,14 +2441,19 @@
       setEngineDirty(true);
       hintError(elements.engineFormError, "");
     });
-    elements.engineEnabled.addEventListener("change", () => setEngineDirty(true));
+    elements.engineEnabled.addEventListener("change", () => {
+      setEngineDirty(true);
+      updateEngineControls();
+    });
     elements.engineTemplate.addEventListener("change", updateTemplateDescription);
     elements.engineApplyTemplate.addEventListener("click", applyTemplate);
     elements.engineSave.addEventListener("click", saveEngine);
     elements.engineStop.addEventListener("click", async () => {
       const approved = await askConfirm({
         title: "停用协议内核？",
-        message: "sing-box 进程将停止，已保存的 JSON 配置会保留。",
+        message: state.engineDirty
+          ? "sing-box 进程将停止，已保存的 JSON 配置会保留；编辑器中未保存的 JSON 草稿也会保留。"
+          : "sing-box 进程将停止，已保存的 JSON 配置会保留。",
         actionLabel: "停用内核",
         tone: "danger",
       });
@@ -2128,31 +2481,46 @@
 
   async function performStopEngine() {
     if (state.engineSaving || !state.engine) return false;
+    const draftWasDirty = state.engineDirty;
+    const configAtClick = state.engine.config || {};
     state.engineSaving = true;
-    elements.engineStop.disabled = true;
+    invalidateEngineRequests();
+    const requestEpoch = state.engineRequestEpoch;
+    updateEngineControls();
     hintError(elements.engineFormError, "");
     try {
-      await api("/api/engine", {
+      const updated = await api("/api/engine", {
         method: "PUT",
+        authRedirect: false,
         body: {
           enabled: false,
-          config: state.engine.config || {},
+          config: configAtClick,
         },
       });
-      setEngineDirty(false);
-      showToast("sing-box 内核已停用。");
-      await loadEngine({ silent: true });
+      if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+      if (!updated || typeof updated !== "object" || Array.isArray(updated)) {
+        throw new ApiError("内核接口没有返回有效状态，请刷新页面确认停用结果。", 0);
+      }
+      elements.engineEnabled.checked = false;
+      renderEngine(updated, { replaceEditor: !draftWasDirty });
+      showToast(draftWasDirty
+        ? "sing-box 内核已停用；未保存的 JSON 草稿已保留。"
+        : "sing-box 内核已停用。");
       return true;
     } catch (error) {
+      if (!state.authenticated || requestEpoch !== state.engineRequestEpoch) return false;
+      if (error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
       hintError(elements.engineFormError, errorMessage(error));
       showToast(`内核停用失败：${errorMessage(error)}`, "error");
       return false;
     } finally {
-      state.engineSaving = false;
-      elements.engineStop.disabled = !state.engine || !state.engine.running;
-      elements.engineSave.disabled = !state.engine || !state.engine.available;
-      elements.engineEnabled.disabled = !state.engine || !state.engine.available;
-      elements.engineConfig.disabled = false;
+      if (requestEpoch === state.engineRequestEpoch) {
+        state.engineSaving = false;
+        updateEngineControls();
+      }
     }
   }
 
