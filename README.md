@@ -41,16 +41,18 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 首次安装会：
 
 - 安装 `/usr/local/bin/relaydeck`，创建 `relaydeck.service`。
-- 尝试探测服务器公网 IP，并为该 IP 和 `localhost` 生成自签 HTTPS 证书。
+- 优先读取本机路由及网卡上的公网 IPv4/IPv6；没有合适的本机地址时，使用多个 HTTPS 检测接口。为选定 IP 和 `localhost` 生成自签 HTTPS 证书。
 - 生成随机管理员密码，通过一条独立的 `printf` 管道交给 `relaydeck init --password-stdin`。密码只在首次安装成功时向 root 终端显示一次，`auth.json` 权限为 `0600`。
 - 监听 `:9443`，通过 HTTPS 提供管理面板。
 
-没有域名时，IPv4 管理地址是 `https://服务器公网IP:9443/`，IPv6 地址要写成 `https://[公网IPv6]:9443/`。浏览器会提示证书不受信任，这是自签 IP 证书的预期行为；确认地址和证书指纹后，可仅为该站点添加信任例外。证书不会获得公共 CA 信任。若自动探测到的公网 IP 与入口 IP 不同，请显式指定：
+没有域名时，IPv4 管理地址是 `https://服务器公网IP:9443/`，IPv6 地址要写成 `https://[公网IPv6]:9443/`。浏览器会提示证书不受信任，这是自签 IP 证书的预期行为；确认地址和证书指纹后，可仅为该站点添加信任例外。证书不会获得公共 CA 信任。检测接口不可达不代表服务器没有公网 IP；脚本会先使用合适的本机地址。若仍无法自动识别，或 NAT、多出口环境下选定 IP 与实际入口不同，请把下例地址替换成这台机器的入口 IP：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
   | env RELAYDECK_PUBLIC_IP=203.0.113.10 bash
 ```
+
+IPv6 环境变量直接填写地址，不加方括号或端口。变量要传给管道右侧的 `bash`；只给左侧 `curl` 设置变量不会传递给安装脚本。
 
 重复执行安装命令即为更新。更新会保留 `/var/lib/relaydeck` 中的认证和配置、`/etc/relaydeck` 中的证书与配置，不会重置管理员密码。安装器会先备份原二进制与原 systemd unit，再原子替换。启动后要连续确认 unit 持续 active、MainPID 稳定且存活、9443 的监听 socket 属于该 PID，并核对 `/healthz` 的同一服务名和版本；任一项不符都会成对恢复，避免其他同端口 HTTPS 服务造成误判。
 

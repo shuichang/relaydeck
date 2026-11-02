@@ -9,8 +9,9 @@ go test ./...
 go test -race ./...
 go vet ./...
 bash -n scripts/install.sh scripts/install-sing-box.sh
-shellcheck scripts/install.sh scripts/install-sing-box.sh
+shellcheck scripts/install.sh scripts/install-sing-box.sh scripts/test-install-ip.sh
 bash scripts/test-installer.sh
+bash scripts/test-install-ip.sh
 ```
 
 真实协议集成测试需要 sing-box 1.14.4；普通 `go test ./...` 在未指定内核时跳过该项：
@@ -55,6 +56,7 @@ RELAYDECK_BINARY="$PWD/.tools/relaydeck-ui" node scripts/test-web.cjs
 - 十份 sing-box 配置模板的 JSON 结构及内核兼容性。
 - 通用直连及 Reality/XUDP 模板经 IPv4/IPv6 入口承载普通 TCP 字节与 UDP 报文的真实回显。
 - 安装器拒绝其他进程占用端口、错误版本与不稳定进程的健康响应。
+- 安装器读取本机公网 IPv4/IPv6、外部检测服务不可用时仍使用本机地址、NAT 多服务回退、显式入口覆盖及无效/保留地址过滤；该检测回归以 mock 执行，不依赖真实外部网络。
 
 ## 不能由这些测试证明的内容
 

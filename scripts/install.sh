@@ -21,7 +21,7 @@ Usage:
 
 Environment:
   RELAYDECK_VERSION     Release tag, for example v0.1.1
-  RELAYDECK_PUBLIC_IP   Public IP to put in the self-signed certificate
+  RELAYDECK_PUBLIC_IP   Explicit IPv4/IPv6 entry address for the certificate
 
 Re-running the installer performs an update and preserves auth/configuration.
 Uninstall keeps /var/lib/relaydeck and /etc/relaydeck.
@@ -136,6 +136,144 @@ atomic_install() {
   mv -f -- "$staged_file" "$destination" || return 1
   staged_file=""
 }
+
+# BEGIN PUBLIC IP HELPERS
+# These helpers are side-effect free until detection is requested, so the
+# network failure paths can be tested without running an installation.
+relaydeck_is_ipv4() {
+  local address="$1" octet
+  local -a octets
+  [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$address"
+  for octet in "${octets[@]}"; do
+    [[ ${#octet} -eq 1 || "${octet:0:1}" != 0 ]] || return 1
+    ((10#$octet <= 255)) || return 1
+  done
+}
+
+relaydeck_is_ipv6() {
+  local address="${1,,}" head tail joined group ipv4 a b c d
+  local -a groups
+  [[ "$address" == *:* && ${#address} -le 45 ]] || return 1
+  if [[ "$address" == *.* ]]; then
+    ipv4="${address##*:}"
+    relaydeck_is_ipv4 "$ipv4" || return 1
+    IFS=. read -r a b c d <<< "$ipv4"
+    printf -v tail '%x:%x' "$((a * 256 + b))" "$((c * 256 + d))"
+    address="${address%:*}:${tail}"
+  fi
+  [[ "$address" =~ ^[0-9a-f:]+$ && "$address" != *:::* ]] || return 1
+  [[ "$address" != :* || "$address" == ::* ]] || return 1
+  [[ "$address" != *: || "$address" == *:: ]] || return 1
+  if [[ "$address" == *::* ]]; then
+    head="${address%%::*}"
+    tail="${address#*::}"
+    [[ "$tail" != *::* ]] || return 1
+    joined="${head}${head:+${tail:+:}}${tail}"
+    [[ -n "$joined" ]] || return 0
+    IFS=: read -r -a groups <<< "$joined"
+    ((${#groups[@]} < 8)) || return 1
+  else
+    [[ "$address" != :* && "$address" != *: ]] || return 1
+    IFS=: read -r -a groups <<< "$address"
+    ((${#groups[@]} == 8)) || return 1
+  fi
+  for group in "${groups[@]}"; do
+    [[ "$group" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+  done
+}
+
+relaydeck_is_public_ipv4() {
+  local a b c _
+  relaydeck_is_ipv4 "$1" || return 1
+  IFS=. read -r a b c _ <<< "$1"
+  # Conservative entry candidates: never select private, shared, loopback,
+  # link-local, documentation, benchmark, multicast or reserved addresses.
+  ((a != 0 && a != 10 && a != 127 && a < 224)) || return 1
+  ! ((a == 100 && b >= 64 && b <= 127)) || return 1
+  ! ((a == 169 && b == 254)) || return 1
+  ! ((a == 172 && b >= 16 && b <= 31)) || return 1
+  ! ((a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99)))) || return 1
+  ! ((a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))) || return 1
+  ! ((a == 203 && b == 0 && c == 113)) || return 1
+  return 0
+}
+
+relaydeck_is_public_ipv6() {
+  local address="${1,,}" first second remainder
+  relaydeck_is_ipv6 "$address" || return 1
+  first="${address%%:*}"
+  # Current ordinary global-unicast VPS allocations are inside 2000::/3.
+  # An explicit override may use any valid literal instead.
+  [[ "$first" =~ ^[23][0-9a-f]{3}$ ]] || return 1
+  remainder="${address#*:}"
+  second="${remainder%%:*}"
+  second="${second:-0}"
+  # Exclude IETF protocol assignments and both documentation ranges.
+  ! ((16#$first == 0x2001 && (16#$second < 0x200 || 16#$second == 0xdb8))) || return 1
+  ! ((16#$first == 0x3fff && 16#$second < 0x1000)) || return 1
+  return 0
+}
+
+relaydeck_detect_public_ip() {
+  local explicit="${1:-}" family route_destination addresses candidate response provider
+  local -a providers
+  if [[ -n "$explicit" ]]; then
+    if relaydeck_is_ipv4 "$explicit" || relaydeck_is_ipv6 "$explicit"; then
+      printf '%s\n' "$explicit"
+      return 0
+    fi
+    return 2
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    for family in 4 6; do
+      route_destination="1.1.1.1"
+      [[ "$family" == 4 ]] || route_destination="2606:4700:4700::1111"
+      # route get only asks the local kernel; it sends no test packets.
+      addresses="$(
+        ip "-${family}" route get "$route_destination" 2>/dev/null |
+          awk '{ for (i=1; i<NF; i++) if ($i == "src") { print $(i+1); exit } }' || true
+        ip -o "-${family}" addr show up scope global 2>/dev/null |
+          awk '!/(^|[[:space:]])(tentative|dadfailed|deprecated)([[:space:]]|$)/ {
+            split($4, address, "/"); print address[1]
+          }' || true
+      )"
+      while IFS= read -r candidate; do
+        if "relaydeck_is_public_ipv${family}" "$candidate"; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      done <<< "$addresses"
+    done
+  fi
+  # NAT hosts may have no public address on an interface. Check independent
+  # HTTPS providers with an explicit family and bounded timeouts. Ignore proxy
+  # environment variables so a proxy's address is not selected by accident.
+  for family in 4 6; do
+    if [[ "$family" == 4 ]]; then
+      providers=(https://api.ipify.org https://ipv4.icanhazip.com https://v4.ident.me)
+    else
+      providers=(https://api6.ipify.org https://ipv6.icanhazip.com https://v6.ident.me)
+    fi
+    for provider in "${providers[@]}"; do
+      if ! response="$(
+        curl "-${family}" --fail --silent --show-error --location \
+          --proto '=https' --proto-redir '=https' --tlsv1.2 --noproxy '*' \
+          --connect-timeout 2 --max-time 4 --max-filesize 128 "$provider" 2>/dev/null
+      )"; then
+        continue
+      fi
+      response="${response#"${response%%[![:space:]]*}"}"
+      response="${response%"${response##*[![:space:]]}"}"
+      if "relaydeck_is_public_ipv${family}" "$response"; then
+        printf '%s\n' "$response"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+# END PUBLIC IP HELPERS
 
 # BEGIN HEALTH CHECK HELPERS
 relaydeck_probe_pid=""
@@ -301,17 +439,15 @@ if [[ -e "$CERT_FILE" || -e "$KEY_FILE" ]]; then
     || die "TLS certificate/key pair is incomplete; restore both files or remove neither safely"
   chmod 0600 "$CERT_FILE" "$KEY_FILE"
 else
-  if [[ -z "$public_ip" ]]; then
-    public_ip="$(
-      curl --fail --silent --show-error --location \
-        --proto '=https' --tlsv1.2 --max-time 8 \
-        'https://api64.ipify.org?format=text' 2>/dev/null || true
-    )"
+  if public_ip="$(relaydeck_detect_public_ip "$public_ip")"; then
+    printf 'Certificate entry IP: %s\n' "$public_ip"
+  else
+    detection_status=$?
+    if ((detection_status == 2)); then
+      die "RELAYDECK_PUBLIC_IP must be a plain IPv4/IPv6 address (no brackets, port or hostname)"
+    fi
+    die "could not determine the entry IP from local interfaces or HTTPS providers; this does not mean the host has no public IP. Rerun: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | env RELAYDECK_PUBLIC_IP=YOUR_IP bash"
   fi
-  [[ -n "$public_ip" ]] \
-    || die "could not detect the public IP; rerun with RELAYDECK_PUBLIC_IP=<entry-ip>"
-  [[ "$public_ip" =~ ^[0-9A-Fa-f:.]+$ && ${#public_ip} -le 64 ]] \
-    || die "RELAYDECK_PUBLIC_IP is not a plain IP address"
   "${tmpdir}/relaydeck" certificate \
     --cert "$CERT_FILE" \
     --key "$KEY_FILE" \

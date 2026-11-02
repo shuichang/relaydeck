@@ -50,7 +50,11 @@ jobs:
           bash -n scripts/install.sh
           bash -n scripts/install-sing-box.sh
           bash -n scripts/test-installer.sh
-          shellcheck scripts/install.sh scripts/install-sing-box.sh scripts/test-installer.sh
+          bash -n scripts/test-install-ip.sh
+          shellcheck scripts/install.sh scripts/install-sing-box.sh scripts/test-installer.sh scripts/test-install-ip.sh
+
+      - name: Installer public IP regression
+        run: bash scripts/test-install-ip.sh
 
       - name: Installer health regression
         run: bash scripts/test-installer.sh
