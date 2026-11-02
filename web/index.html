@@ -150,6 +150,9 @@
             <span class="status-dot"></span>
             <span>连接中</span>
           </span>
+          <span id="browser-panel-rtt" class="browser-rtt" title="浏览器发起 /api/status 并收到响应的 HTTP 往返耗时；不代表规则入口 TCP、目标 TCP 或协议 RTT" hidden>
+            浏览器↔面板 HTTP <strong id="browser-panel-rtt-value">—</strong>
+          </span>
           <span id="clock" class="clock" aria-label="本地时间"></span>
         </div>
       </header>
@@ -188,7 +191,7 @@
             <article class="stat-card">
               <div class="stat-icon"><svg class="icon" aria-hidden="true"><use href="#i-terminal"></use></svg></div>
               <div class="stat-meta"><span>活跃连接</span><strong id="stat-connections">—</strong></div>
-              <span class="stat-note">当前 TCP 连接</span>
+              <span id="stat-connections-note" class="stat-note">当前 TCP 连接</span>
             </article>
             <article class="stat-card">
               <div class="stat-icon"><svg class="icon" aria-hidden="true"><use href="#i-grid"></use></svg></div>
@@ -291,7 +294,7 @@
                   <tr>
                     <th>规则</th>
                     <th>协议</th>
-                    <th>监听 → 目标</th>
+                    <th>入口 → 目标 / 最近检测</th>
                     <th>连接限制</th>
                     <th>实时状态</th>
                     <th><span class="visually-hidden">操作</span></th>
@@ -326,7 +329,11 @@
             </article>
             <article class="info-note">
               <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
-              <div><strong>访问与限流</strong><p>CIDR 留空表示允许全部来源。连接上限设为 0 时采用默认 256，最大 4096；UDP 超时范围为 1 到 86400 秒。</p></div>
+              <div><strong>访问与限流</strong><p>CIDR 留空表示允许全部来源。连接上限设为 0 时采用默认 8192，最大 65536；UDP 超时范围为 1 到 86400 秒。</p></div>
+            </article>
+            <article class="info-note">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              <div><strong>连通性检测</strong><p>入口检测只覆盖本机监听与端口可绑定状态，不测量外部客户端到入口的网络延迟；目标检测里 TCP 毫秒只代表本机到目标的握手。UDP 没有通用握手，需用真实双向流量验证。</p></div>
             </article>
           </div>
         </section>
@@ -376,6 +383,7 @@
                 <button id="engine-apply-template" class="button secondary" type="button" disabled>应用模板</button>
               </div>
               <p id="engine-template-description" class="field-hint template-description">选择模板后可继续编辑。</p>
+              <p class="template-guidance">模板只定义可选出站隧道，不限制转发规则的上层协议。普通 TCP/UDP 转发无需协议内核；Reality 模板支持 XUDP 且要求远端兼容，SSH 示例仅 TCP。出站隧道是否支持 UDP 取决于模板及远端。</p>
               <label class="field">
                 <span>JSON 配置</span>
                 <textarea id="engine-config" class="code-editor" spellcheck="false" autocomplete="off" placeholder="{&#10;  &quot;log&quot;: { &quot;level&quot;: &quot;info&quot; }&#10;}"></textarea>
@@ -436,12 +444,12 @@
             <article class="help-card">
               <span class="help-number">02</span>
               <h3>协议与 UDP</h3>
-              <p>规则可选择 TCP、UDP 或两者。UDP 会话有独立空闲超时；高并发场景请结合实际协议和应用回包路径设置超时与连接上限。</p>
+              <p>普通规则按 TCP/UDP 透明转发，支持的上层协议不受模板限制。出站隧道是否支持 UDP 取决于模板及远端；Reality 模板支持 XUDP，要求远端兼容，SSH 示例仅 TCP。UDP 会话有独立空闲超时。</p>
             </article>
             <article class="help-card">
               <span class="help-number">03</span>
               <h3>访问控制</h3>
-              <p>使用 CIDR 限制来源地址，每行或逗号分隔一项。连接上限为 0 时采用默认值 256，最大 4096。规则的变更会原子保存；绑定失败时服务端会恢复原规则。</p>
+              <p>使用 CIDR 限制来源地址，每行或逗号分隔一项。连接上限为 0 时采用默认值 8192，最大 65536。规则的变更会原子保存；绑定失败时服务端会恢复原规则。</p>
             </article>
             <article class="help-card">
               <span class="help-number">04</span>
@@ -497,6 +505,7 @@
             <label><input type="radio" name="rule-network" value="tcp"><span>仅 TCP</span></label>
             <label><input type="radio" name="rule-network" value="udp"><span>仅 UDP</span></label>
           </div>
+          <small>普通规则按 TCP/UDP 透明转发，支持的上层协议不受协议内核模板限制；普通转发无需协议内核。</small>
         </fieldset>
         <div class="form-grid two">
           <label class="field">
@@ -518,8 +527,8 @@
         <div class="form-grid two">
           <label class="field">
             <span>最大连接数</span>
-            <input id="rule-max-connections" type="number" min="0" max="4096" step="1" value="256" inputmode="numeric">
-            <small>0 表示使用默认值 256，最大 4096。</small>
+            <input id="rule-max-connections" type="number" min="0" max="65536" step="1" value="8192" inputmode="numeric">
+            <small>0 表示使用默认值 8192，最大 65536；已有显式值会保持。</small>
           </label>
           <label class="field">
             <span>UDP 空闲超时</span>
@@ -527,6 +536,44 @@
             <small>范围 1–86400 秒，仅对 UDP 会话生效。</small>
           </label>
         </div>
+        <section class="probe-panel" aria-labelledby="rule-probe-title">
+          <div class="probe-panel-heading">
+            <div>
+              <strong id="rule-probe-title">保存前连通性预检</strong>
+              <p>入口只检查本机监听状态；目标在 TCP + UDP 模式下只验证 TCP 握手。</p>
+            </div>
+            <button id="rule-probe" class="button secondary" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+              <span>检测连通性</span>
+            </button>
+          </div>
+          <div class="probe-http-rtt">
+            <span>浏览器↔面板 HTTP <strong id="rule-probe-http-rtt">尚未测量</strong></span>
+            <small>这是 /api/status 请求往返耗时，不代表规则入口 TCP、目标 TCP 或协议 RTT。</small>
+          </div>
+          <div id="rule-probe-notice" class="probe-notice" aria-live="polite">修改监听地址、目标、协议或探测相关配置后，需要重新检测。</div>
+          <div class="probe-results" aria-live="polite">
+            <article id="rule-listen-probe" class="probe-card neutral">
+              <div class="probe-card-heading">
+                <span>入口监听</span>
+                <span id="rule-listen-probe-badge" class="probe-status neutral">未检测</span>
+              </div>
+              <strong id="rule-listen-probe-metric">尚未检查入口</strong>
+              <p id="rule-listen-probe-message">检测会检查端口可绑定或当前监听状态，不主动连接入口；外部客户端链路需另行测量。</p>
+              <small id="rule-listen-probe-time"></small>
+            </article>
+            <article id="rule-target-probe" class="probe-card neutral">
+              <div class="probe-card-heading">
+                <span>目标连通</span>
+                <span id="rule-target-probe-badge" class="probe-status neutral">未检测</span>
+              </div>
+              <strong id="rule-target-probe-metric">尚未检查目标</strong>
+              <p id="rule-target-probe-message">TCP 结果为握手；UDP 不使用随机报文，需真实双向流量验证。</p>
+              <small id="rule-target-probe-time"></small>
+              <code id="rule-target-probe-address" class="probe-address" hidden></code>
+            </article>
+          </div>
+        </section>
         <div id="rule-form-error" class="inline-alert error" role="alert" hidden></div>
       </div>
       <div class="modal-actions">

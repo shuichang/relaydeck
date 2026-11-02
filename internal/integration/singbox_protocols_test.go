@@ -167,6 +167,22 @@ func TestSingBoxProtocols(t *testing.T) {
 					want := "relaydeck-e2e:" + protocol.name
 					requestThroughDirect(t, directAddress, want, client, server)
 
+					// The peer can receive the response before the forwarding
+					// goroutine resumes after Write and updates its counter.
+					// Wait for accounting, without issuing another request.
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						ready := false
+						for _, row := range manager.Snapshot() {
+							if row.ID == path.ruleID && row.BytesIn > 0 && row.BytesOut > 0 {
+								ready = true
+							}
+						}
+						if ready {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
 					snapshot := manager.Snapshot()
 					var found bool
 					for _, row := range snapshot {

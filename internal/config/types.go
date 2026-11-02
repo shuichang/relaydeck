@@ -2,6 +2,13 @@ package config
 
 import "encoding/json"
 
+const (
+	// DefaultMaxConnections is used when a rule leaves max_connections at zero.
+	DefaultMaxConnections = 8192
+	// MaxConnections is the largest explicit per-rule connection limit.
+	MaxConnections = 65536
+)
+
 type Rule struct {
 	ID             string   `json:"id"`
 	Name           string   `json:"name"`

@@ -39,17 +39,26 @@ func (m *Manager) Templates() []Template {
 func buildTemplates() []Template {
 	return []Template{
 		newTemplate(
+			"direct-passthrough",
+			"TCP/UDP 直连",
+			"通用 TCP/UDP 直连模板：本机 direct 入站经 direct 出站转发到目标地址。此项是可选的内核出站隧道，不限制或替换 RelayDeck 原生转发规则；原生 TCP/UDP 转发无需启动 sing-box。",
+			relayConfig("", 12000, "203.0.113.20", 443, map[string]any{
+				"type": "direct",
+				"tag":  "direct",
+			}, nil),
+		),
+		newTemplate(
 			"direct-vless-reality",
 			"VLESS + Reality",
-			"本机 direct 入站经 VLESS/Reality 转发。替换服务器、UUID、SNI、Reality 公钥、short_id 与目标地址。",
-			relayConfig("tcp", 12001, "203.0.113.20", 443, map[string]any{
-				"type":        "vless",
-				"tag":         "proxy",
-				"server":      "203.0.113.10",
-				"server_port": 443,
-				"uuid":        "00000000-0000-4000-8000-000000000001",
-				"flow":        "xtls-rprx-vision",
-				"network":     "tcp",
+			"本机 direct 入站经 VLESS/Reality 出站隧道转发，可承载配置允许的 TCP 与 UDP 流量（远端也须支持 XUDP）；它不会把其他协议自动转换为 Reality，也不限制 RelayDeck 原生规则。替换服务器、UUID、SNI、Reality 公钥、short_id 与目标地址。",
+			relayConfig("", 12001, "203.0.113.20", 443, map[string]any{
+				"type":            "vless",
+				"tag":             "proxy",
+				"server":          "203.0.113.10",
+				"server_port":     443,
+				"uuid":            "00000000-0000-4000-8000-000000000001",
+				"flow":            "xtls-rprx-vision",
+				"packet_encoding": "xudp",
 				"tls": map[string]any{
 					"enabled":     true,
 					"server_name": "reality.example.com",
@@ -134,7 +143,7 @@ func buildTemplates() []Template {
 		newTemplate(
 			"direct-ssh",
 			"SSH",
-			"本机 direct 入站经 SSH 转发。替换服务器、用户、密码与目标地址；生产环境应填写可信 host_key。",
+			"本机 direct 入站仅以 TCP 经 SSH 转发。替换服务器、用户、密码与目标地址；生产环境应填写可信 host_key。",
 			relayConfig("tcp", 12006, "203.0.113.20", 22, map[string]any{
 				"type":        "ssh",
 				"tag":         "proxy",

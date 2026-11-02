@@ -227,7 +227,10 @@ func copyTCPHalf(counter *atomic.Uint64, results chan<- copyResult, dst, src *ne
 	buffer := tcpCopyBufferPool.Get().(*[]byte)
 	defer tcpCopyBufferPool.Put(buffer)
 
-	_, err := io.CopyBuffer(countingTCPWriter{conn: dst, counter: counter}, src, *buffer)
+	// TCPConn.WriteTo would bypass CopyBuffer's buffer and, because our
+	// counting writer cannot use splice, allocate another 32 KiB per direction.
+	// Hide WriterTo so every stream really uses the bounded pooled buffer.
+	_, err := io.CopyBuffer(countingTCPWriter{conn: dst, counter: counter}, struct{ io.Reader }{src}, *buffer)
 	_ = dst.CloseWrite()
 	results <- copyResult{err: err}
 }

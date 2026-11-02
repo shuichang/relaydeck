@@ -10,6 +10,9 @@
   const POLL_INTERVAL = 8000;
   const THEME_KEY = "relaydeck-theme";
   const SAFE_NETWORKS = new Set(["tcp", "udp", "both"]);
+  const SAFE_PROBE_STATUSES = new Set(["listening", "available", "reachable", "error", "unverified"]);
+  const DEFAULT_MAX_CONNECTIONS = 8192;
+  const MAX_CONNECTIONS = 65536;
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -20,11 +23,24 @@
     route: "overview",
     status: null,
     statusLoading: false,
+    browserPanelRttMs: null,
     rules: [],
     rulesLoaded: false,
     rulesLoading: false,
     rulesSaving: false,
     editingRuleIndex: -1,
+    ruleProbeResults: new Map(),
+    ruleProbePending: new Map(),
+    ruleProbeLatest: new Map(),
+    ruleProbeSequence: 0,
+    ruleDraftProbe: {
+      token: 0,
+      key: "",
+      phase: "idle",
+      result: null,
+      error: "",
+      controller: null,
+    },
     engine: null,
     engineLoaded: false,
     engineLoading: false,
@@ -56,6 +72,9 @@
     servicePill: byId("service-pill"),
     sidebarStatusDot: byId("sidebar-status-dot"),
     sidebarVersion: byId("sidebar-version-text"),
+    browserPanelRtt: byId("browser-panel-rtt"),
+    browserPanelRttValue: byId("browser-panel-rtt-value"),
+    ruleProbeHttpRtt: byId("rule-probe-http-rtt"),
     navRuleCount: byId("nav-rule-count"),
     rulesBody: byId("rules-body"),
     rulesLoading: byId("rules-loading"),
@@ -70,6 +89,19 @@
     ruleDialogTitle: byId("rule-dialog-title"),
     ruleFormError: byId("rule-form-error"),
     ruleSubmit: byId("rule-submit"),
+    ruleProbe: byId("rule-probe"),
+    ruleProbeNotice: byId("rule-probe-notice"),
+    ruleListenProbe: byId("rule-listen-probe"),
+    ruleListenProbeBadge: byId("rule-listen-probe-badge"),
+    ruleListenProbeMetric: byId("rule-listen-probe-metric"),
+    ruleListenProbeMessage: byId("rule-listen-probe-message"),
+    ruleListenProbeTime: byId("rule-listen-probe-time"),
+    ruleTargetProbe: byId("rule-target-probe"),
+    ruleTargetProbeBadge: byId("rule-target-probe-badge"),
+    ruleTargetProbeMetric: byId("rule-target-probe-metric"),
+    ruleTargetProbeMessage: byId("rule-target-probe-message"),
+    ruleTargetProbeTime: byId("rule-target-probe-time"),
+    ruleTargetProbeAddress: byId("rule-target-probe-address"),
     confirmDialog: byId("confirm-dialog"),
     confirmTitle: byId("confirm-title"),
     confirmMessage: byId("confirm-message"),
@@ -259,6 +291,138 @@
     return Number.isFinite(number) ? number : null;
   }
 
+  function effectiveMaxConnections(rule) {
+    const effective = numberOrNull(rule && rule.effective_max_connections);
+    if (effective !== null) return Math.max(0, effective);
+    const configured = numberOrNull(rule && rule.max_connections);
+    return configured && configured > 0 ? configured : DEFAULT_MAX_CONNECTIONS;
+  }
+
+  function normalizedProbeEndpoint(value) {
+    const endpoint = value && typeof value === "object" ? value : {};
+    return {
+      status: SAFE_PROBE_STATUSES.has(endpoint.status) ? endpoint.status : "unverified",
+      latency_ms: numberOrNull(endpoint.latency_ms),
+      message: typeof endpoint.message === "string" ? endpoint.message : "",
+      udp_status: typeof endpoint.udp_status === "string" ? endpoint.udp_status : "",
+    };
+  }
+
+  function normalizedProbeResult(value) {
+    if (!value || typeof value !== "object") {
+      throw new ApiError("连通性检测接口返回格式无效。", 0);
+    }
+    return {
+      checked_at: typeof value.checked_at === "string" ? value.checked_at : "",
+      target_address: typeof value.target_address === "string" ? value.target_address : "",
+      listen: normalizedProbeEndpoint(value.listen),
+      target: normalizedProbeEndpoint(value.target),
+    };
+  }
+
+  function probePayload(rule) {
+    return {
+      id: typeof rule.id === "string" ? rule.id : "",
+      name: typeof rule.name === "string" ? rule.name : "",
+      enabled: Boolean(rule.enabled),
+      network: SAFE_NETWORKS.has(rule.network) ? rule.network : "both",
+      listen: typeof rule.listen === "string" ? rule.listen.trim() : "",
+      target: typeof rule.target === "string" ? rule.target.trim() : "",
+      allowed_cidrs: Array.isArray(rule.allowed_cidrs) ? rule.allowed_cidrs : [],
+      max_connections: Number(rule.max_connections) || 0,
+      udp_timeout: Number(rule.udp_timeout) || 0,
+    };
+  }
+
+  function probeCacheKey(rule) {
+    const payload = probePayload(rule);
+    return JSON.stringify({
+      id: payload.id,
+      enabled: payload.enabled,
+      network: payload.network,
+      listen: payload.listen,
+      target: payload.target,
+      allowed_cidrs: payload.allowed_cidrs,
+      max_connections: payload.max_connections,
+      udp_timeout: payload.udp_timeout,
+    });
+  }
+
+  function beginRuleProbe(key) {
+    const sequence = ++state.ruleProbeSequence;
+    state.ruleProbeLatest.set(key, sequence);
+    return sequence;
+  }
+
+  function rememberRuleProbe(key, sequence, result) {
+    if (state.ruleProbeLatest.get(key) !== sequence) return false;
+    state.ruleProbeResults.set(key, result);
+    return true;
+  }
+
+  function formatProbeLatency(value) {
+    const latency = numberOrNull(value);
+    if (latency === null) return "";
+    const digits = latency < 10 ? 2 : 1;
+    return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: digits }).format(latency)} ms`;
+  }
+
+  function formatProbeTime(value) {
+    const date = value ? new Date(value) : null;
+    if (!date || !Number.isFinite(date.getTime())) return "检测时间未知";
+    return `检测于 ${new Intl.DateTimeFormat("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(date)}`;
+  }
+
+  function updateBrowserPanelRtt(elapsedMs) {
+    const value = numberOrNull(elapsedMs);
+    if (value === null || value < 0) return;
+    state.browserPanelRttMs = value;
+    const formatted = `${new Intl.NumberFormat("zh-CN", {
+      maximumFractionDigits: value < 100 ? 1 : 0,
+    }).format(value)} ms`;
+    if (elements.browserPanelRttValue) elements.browserPanelRttValue.textContent = formatted;
+    if (elements.browserPanelRtt) {
+      elements.browserPanelRtt.hidden = false;
+      elements.browserPanelRtt.setAttribute(
+        "aria-label",
+        `浏览器到面板的最近一次 HTTP 往返耗时 ${formatted}；不代表规则入口或协议 RTT`,
+      );
+    }
+    if (elements.ruleProbeHttpRtt) elements.ruleProbeHttpRtt.textContent = formatted;
+  }
+
+  function probeStatusPresentation(status) {
+    switch (status) {
+      case "listening":
+        return { text: "监听中", tone: "ok" };
+      case "available":
+        return { text: "可绑定", tone: "ok" };
+      case "reachable":
+        return { text: "TCP 可达", tone: "ok" };
+      case "error":
+        return { text: "检测失败", tone: "bad" };
+      default:
+        return { text: "未验证", tone: "warn" };
+    }
+  }
+
+  function setProbeBadge(node, text, tone = "neutral") {
+    if (!node) return;
+    node.textContent = text;
+    node.className = `probe-status ${tone}`;
+  }
+
+  function setProbeCard(card, tone) {
+    if (card) card.className = `probe-card ${tone || "neutral"}`;
+  }
+
   function sumRules(field) {
     return state.rules.reduce((total, rule) => total + (numberOrNull(rule[field]) || 0), 0);
   }
@@ -296,6 +460,10 @@
       ?? (rulesLoaded ? state.rules.filter((rule) => rule.running).length : null);
     const connections = numberOrNull(forward.active_connections)
       ?? (rulesLoaded ? sumRules("active_connections") : null);
+    const effectiveConnections = numberOrNull(forward.effective_max_connections)
+      ?? (rulesLoaded
+        ? state.rules.reduce((total, rule) => total + effectiveMaxConnections(rule), 0)
+        : null);
     const udpSessions = numberOrNull(forward.udp_sessions)
       ?? (rulesLoaded ? sumRules("udp_sessions") : null);
     const bytesIn = numberOrNull(forward.bytes_in)
@@ -319,6 +487,18 @@
     } else {
       setText("stat-rules-note", "等待规则数据");
       setText("stat-running-note", "等待运行状态");
+    }
+
+    const connectionsNote = byId("stat-connections-note");
+    if (connectionsNote) {
+      if (connections === null || effectiveConnections === null || effectiveConnections <= 0) {
+        connectionsNote.textContent = "当前 TCP 连接";
+        connectionsNote.className = "stat-note";
+      } else {
+        const ratio = connections / effectiveConnections;
+        connectionsNote.textContent = `${formatNumber(connections)} / ${formatNumber(effectiveConnections)} 有效上限`;
+        connectionsNote.className = `stat-note${ratio >= 1 ? " danger" : ratio >= 0.8 ? " warning" : ""}`;
+      }
     }
 
     setText("detail-version", status && status.version);
@@ -370,7 +550,9 @@
     if (state.statusLoading || !state.authenticated) return null;
     state.statusLoading = true;
     try {
+      const requestStarted = window.performance.now();
       const status = await api("/api/status");
+      updateBrowserPanelRtt(window.performance.now() - requestStarted);
       if (!status || typeof status !== "object") {
         throw new ApiError("状态接口返回了无效数据。", 0);
       }
@@ -421,6 +603,7 @@
       max_connections: numberOrNull(rule.max_connections) || 0,
       udp_timeout: numberOrNull(rule.udp_timeout) || 0,
       active_connections: numberOrNull(rule.active_connections) || 0,
+      effective_max_connections: numberOrNull(rule.effective_max_connections),
       bytes_in: numberOrNull(rule.bytes_in) || 0,
       bytes_out: numberOrNull(rule.bytes_out) || 0,
       error: typeof rule.error === "string" ? rule.error : "",
@@ -462,21 +645,46 @@
   }
 
   function makeEndpoint(rule) {
-    const wrapper = createElement("div", "endpoint");
-    wrapper.append(createElement("code", "", rule.listen || "—"));
-    wrapper.append(createIcon("chevron"));
-    wrapper.append(createElement("code", "", rule.target || "—"));
+    const wrapper = createElement("div", "endpoint-stack");
+    const route = createElement("div", "endpoint");
+    route.append(createElement("code", "", rule.listen || "—"));
+    route.append(createIcon("chevron"));
+    route.append(createElement("code", "", rule.target || "—"));
+    wrapper.append(route);
+    wrapper.append(makeRuleProbeSummary(rule));
     return wrapper;
   }
 
   function makeLimits(rule) {
     const wrapper = createElement("div", "limit-list");
+    const effectiveMax = effectiveMaxConnections(rule);
+    const transports = [];
+    if (rule.network !== "udp") transports.push(["TCP 连接", rule.active_connections]);
+    if (rule.network !== "tcp") transports.push(["UDP 会话", rule.udp_sessions]);
+    transports.forEach(([label, count]) => {
+      const active = numberOrNull(count) || 0;
+      const usage = effectiveMax > 0 ? active / effectiveMax : 0;
+      const usageLine = createElement(
+        "span",
+        `limit-usage${usage >= 1 ? " full" : usage >= 0.8 ? " near" : ""}`,
+      );
+      usageLine.append(createElement("strong", "", label));
+      usageLine.append(document.createTextNode(
+        ` ${formatNumber(active)} / ${formatNumber(effectiveMax)}`,
+      ));
+      if (usage >= 1) {
+        usageLine.append(createElement("em", "", "已达上限"));
+      } else if (usage >= 0.8) {
+        usageLine.append(createElement("em", "", "接近上限"));
+      }
+      wrapper.append(usageLine);
+    });
     wrapper.append(createElement(
       "span",
       "",
       rule.max_connections > 0
-        ? `连接上限 ${formatNumber(rule.max_connections)}`
-        : "连接上限默认 256",
+        ? `配置上限 ${formatNumber(rule.max_connections)}`
+        : `配置上限 0 · 默认 ${formatNumber(DEFAULT_MAX_CONNECTIONS)}`,
     ));
     wrapper.append(createElement(
       "span",
@@ -491,6 +699,144 @@
       rule.network === "tcp" ? "UDP 未启用" : `UDP 空闲 ${formatNumber(rule.udp_timeout)} 秒`,
     ));
     return wrapper;
+  }
+
+  function appendProbeSummaryLine(wrapper, label, statusText, tone, detail) {
+    const line = createElement("div", "rule-probe-line");
+    line.append(createElement("span", "rule-probe-label", label));
+    line.append(createElement("span", `probe-status ${tone}`, statusText));
+    line.append(createElement("span", "rule-probe-detail", detail || ""));
+    wrapper.append(line);
+  }
+
+  function makeRuleProbeSummary(rule) {
+    const key = probeCacheKey(rule);
+    const pending = state.ruleProbePending.get(key);
+    const stored = state.ruleProbeResults.get(key);
+    const wrapper = createElement("div", "rule-probe");
+    const heading = createElement("div", "rule-probe-heading");
+    heading.append(createElement("span", "", "最近检测"));
+
+    const probeButton = createElement("button", "probe-mini-action");
+    probeButton.type = "button";
+    probeButton.disabled = Boolean(pending);
+    probeButton.setAttribute("aria-label", pending ? "正在检测连通性" : `检测“${rule.name}”的连通性`);
+    probeButton.append(createIcon("refresh"));
+    probeButton.append(createElement("span", "", pending ? "检测中…" : "检测"));
+    probeButton.addEventListener("click", () => probeRule(rule));
+    heading.append(probeButton);
+    wrapper.append(heading);
+
+    if (pending) {
+      appendProbeSummaryLine(wrapper, "入口", "检测中…", "neutral", "本机监听检查");
+      appendProbeSummaryLine(wrapper, "目标", "检测中…", "neutral", "TCP 握手 / UDP 验证范围");
+      wrapper.append(createElement("small", "rule-probe-time", "检测请求进行中"));
+      return wrapper;
+    }
+
+    if (!stored) {
+      appendProbeSummaryLine(wrapper, "入口", "待检测", "neutral", "本机监听 / 端口可绑定");
+      appendProbeSummaryLine(wrapper, "目标", "待检测", "neutral", "UDP 不发送随机测试包");
+      return wrapper;
+    }
+
+    if (stored.error) {
+      appendProbeSummaryLine(wrapper, "入口", "检测失败", "bad", "未取得本机监听结果");
+      appendProbeSummaryLine(wrapper, "目标", "检测失败", "bad", "未取得目标握手结果");
+      wrapper.append(createElement("small", "rule-probe-time", formatProbeTime(stored.receivedAt)));
+      const details = createElement("details", "probe-details");
+      details.append(createElement("summary", "", "查看检测原因"));
+      details.append(createElement("p", "", stored.error));
+      wrapper.append(details);
+      return wrapper;
+    }
+
+    const result = stored.result;
+    const listenStatus = probeStatusPresentation(result.listen.status);
+    let listenDetail = "";
+    if (result.listen.status === "listening" && result.listen.latency_ms !== null) {
+      listenDetail = `本机 TCP ${formatProbeLatency(result.listen.latency_ms)}`;
+    } else if (result.listen.status === "listening") {
+      listenDetail = "本机监听正常 · 外部延迟需客户端测量";
+    } else if (result.listen.status === "available") {
+      listenDetail = rule.network === "udp" ? "UDP 端口可绑定" : "TCP 端口可绑定";
+    } else if (result.listen.status === "error") {
+      listenDetail = "入口监听检查失败";
+    } else {
+      listenDetail = "入口状态未验证";
+    }
+    if (result.listen.udp_status === "unverified" && rule.network !== "tcp") {
+      listenDetail += " · UDP 未验证";
+    }
+    appendProbeSummaryLine(wrapper, "入口", listenStatus.text, listenStatus.tone, listenDetail);
+
+    const targetStatus = probeStatusPresentation(result.target.status);
+    let targetDetail = "";
+    if (result.target.status === "reachable" && result.target.latency_ms !== null) {
+      targetDetail = `TCP ${formatProbeLatency(result.target.latency_ms)}`;
+    } else if (result.target.status === "error") {
+      targetDetail = rule.network === "udp" ? "目标解析或检测失败" : "TCP 握手失败";
+    } else if (rule.network === "udp") {
+      targetDetail = "无通用握手";
+    } else {
+      targetDetail = "目标状态未验证";
+    }
+    if (result.target.udp_status === "unverified" && rule.network !== "tcp") {
+      targetDetail += " · UDP 未验证";
+    }
+    appendProbeSummaryLine(wrapper, "目标", targetStatus.text, targetStatus.tone, targetDetail);
+    wrapper.append(createElement("small", "rule-probe-time", formatProbeTime(result.checked_at || stored.receivedAt)));
+
+    const messages = [];
+    if (result.listen.message) messages.push(["入口", result.listen.message]);
+    if (result.target.message) messages.push(["目标", result.target.message]);
+    if (messages.length > 0) {
+      const details = createElement("details", "probe-details");
+      details.append(createElement("summary", "", "查看完整检测说明"));
+      messages.forEach(([label, message]) => {
+        const paragraph = createElement("p");
+        paragraph.append(createElement("strong", "", `${label}：`));
+        paragraph.append(document.createTextNode(message));
+        details.append(paragraph);
+      });
+      if (result.target_address) {
+        details.append(createElement("small", "", `解析目标：${result.target_address}`));
+      }
+      wrapper.append(details);
+    }
+    return wrapper;
+  }
+
+  async function probeRule(rule, { announce = true } = {}) {
+    if (!rule || !SAFE_NETWORKS.has(rule.network)) return false;
+    const key = probeCacheKey(rule);
+    if (state.ruleProbePending.has(key)) return false;
+    const sequence = beginRuleProbe(key);
+    state.ruleProbePending.set(key, { sequence, startedAt: Date.now() });
+    if (state.route === "rules") renderRules();
+    try {
+      const response = await api("/api/rules/probe", {
+        method: "POST",
+        body: { rule: probePayload(rule) },
+      });
+      const result = normalizedProbeResult(response);
+      return rememberRuleProbe(key, sequence, {
+        result,
+        receivedAt: result.checked_at || new Date().toISOString(),
+      });
+    } catch (error) {
+      const current = rememberRuleProbe(key, sequence, {
+        error: errorMessage(error),
+        receivedAt: new Date().toISOString(),
+      });
+      if (current && announce) showToast(`连通性检测失败：${errorMessage(error)}`, "error", 6000);
+      return false;
+    } finally {
+      if (state.ruleProbePending.get(key)?.sequence === sequence) {
+        state.ruleProbePending.delete(key);
+      }
+      if (state.route === "rules") renderRules();
+    }
   }
 
   function makeRuntime(rule) {
@@ -739,9 +1085,9 @@
     if (
       !Number.isInteger(rule.max_connections) ||
       rule.max_connections < 0 ||
-      rule.max_connections > 4096
+      rule.max_connections > MAX_CONNECTIONS
     ) {
-      return "最大连接数必须在 0 到 4096 之间；0 表示采用默认值 256。";
+      return `最大连接数必须在 0 到 ${MAX_CONNECTIONS} 之间；0 表示采用默认值 ${DEFAULT_MAX_CONNECTIONS}。`;
     }
     if (
       !Number.isInteger(rule.udp_timeout) ||
@@ -751,6 +1097,258 @@
       return "UDP 空闲超时必须在 1 到 86400 秒之间。";
     }
     return "";
+  }
+
+  function currentDraftProbeKey(rule = readRuleForm()) {
+    return probeCacheKey(rule || readRuleForm());
+  }
+
+  function stopDraftProbeRequest() {
+    const draft = state.ruleDraftProbe;
+    draft.token += 1;
+    if (draft.controller) {
+      draft.controller.abort();
+      draft.controller = null;
+    }
+  }
+
+  function setDraftProbeNotice(message, tone = "") {
+    elements.ruleProbeNotice.textContent = message;
+    elements.ruleProbeNotice.className = `probe-notice${tone ? ` ${tone}` : ""}`;
+  }
+
+  function renderDraftProbePlaceholder(phase, message) {
+    const invalidated = phase === "invalidated";
+    setProbeCard(elements.ruleListenProbe, invalidated ? "warn" : "neutral");
+    setProbeBadge(elements.ruleListenProbeBadge, invalidated ? "需重新检测" : "未检测", invalidated ? "warn" : "neutral");
+    elements.ruleListenProbeMetric.textContent = invalidated ? "旧入口结果已清除" : "尚未检查入口";
+    elements.ruleListenProbeMessage.textContent = invalidated
+      ? "配置已变化，请重新检测入口监听状态。"
+      : "检测会检查端口可绑定或当前监听状态，不主动连接入口；外部客户端链路需另行测量。";
+    elements.ruleListenProbeTime.textContent = "";
+
+    setProbeCard(elements.ruleTargetProbe, invalidated ? "warn" : "neutral");
+    setProbeBadge(elements.ruleTargetProbeBadge, invalidated ? "需重新检测" : "未检测", invalidated ? "warn" : "neutral");
+    elements.ruleTargetProbeMetric.textContent = invalidated ? "旧目标结果已清除" : "尚未检查目标";
+    elements.ruleTargetProbeMessage.textContent = invalidated
+      ? "配置已变化，请重新检测目标握手范围。"
+      : "TCP 结果为握手；UDP 不使用随机报文，需真实双向流量验证。";
+    elements.ruleTargetProbeTime.textContent = "";
+    elements.ruleTargetProbeAddress.hidden = true;
+    elements.ruleTargetProbeAddress.textContent = "";
+    setDraftProbeNotice(message || "修改监听地址、目标、协议或探测相关配置后，需要重新检测。");
+  }
+
+  function renderDraftProbeResult(result) {
+    const network = readRuleForm().network;
+    const listenPresentation = probeStatusPresentation(result.listen.status);
+    let listenMetric = "本机监听状态未验证";
+    if (result.listen.latency_ms !== null) {
+      listenMetric = `本机 TCP ${formatProbeLatency(result.listen.latency_ms)}`;
+    } else if (result.listen.status === "listening") {
+      listenMetric = "本机监听正常 · 外部延迟需客户端测量";
+    } else if (result.listen.status === "available") {
+      listenMetric = network === "udp" ? "UDP 端口可绑定" : "TCP 端口可绑定";
+    } else if (result.listen.status === "error") {
+      listenMetric = "入口监听检查失败";
+    } else if (result.listen.status === "unverified") {
+      listenMetric = "入口状态未验证";
+    }
+    if (result.listen.udp_status === "unverified") {
+      listenMetric += " · UDP 未验证";
+    }
+    setProbeCard(elements.ruleListenProbe, listenPresentation.tone);
+    setProbeBadge(elements.ruleListenProbeBadge, listenPresentation.text, listenPresentation.tone);
+    elements.ruleListenProbeMetric.textContent = listenMetric;
+    elements.ruleListenProbeMessage.textContent = result.listen.message
+      || "入口检测只在本机执行，不代表外部客户端到入口的链路已通过。";
+    elements.ruleListenProbeTime.textContent = formatProbeTime(result.checked_at);
+
+    const targetPresentation = probeStatusPresentation(result.target.status);
+    if (result.target.status === "unverified" && network === "udp") {
+      targetPresentation.text = "UDP 未验证";
+    }
+    let targetMetric = "TCP 未计时";
+    if (result.target.latency_ms !== null) {
+      targetMetric = `TCP ${formatProbeLatency(result.target.latency_ms)}`;
+    } else if (result.target.status === "unverified") {
+      targetMetric = "UDP 无通用握手";
+    } else if (result.target.status === "error") {
+      targetMetric = "解析或握手失败";
+    }
+    if (result.target.udp_status === "unverified") {
+      targetMetric += " · UDP 未验证";
+    }
+    setProbeCard(elements.ruleTargetProbe, targetPresentation.tone);
+    setProbeBadge(elements.ruleTargetProbeBadge, targetPresentation.text, targetPresentation.tone);
+    elements.ruleTargetProbeMetric.textContent = targetMetric;
+    elements.ruleTargetProbeMessage.textContent = result.target.message
+      || "TCP 握手不代表应用协议、认证或 UDP 双向流量已通过。";
+    elements.ruleTargetProbeTime.textContent = formatProbeTime(result.checked_at);
+    elements.ruleTargetProbeAddress.hidden = !result.target_address;
+    elements.ruleTargetProbeAddress.textContent = result.target_address
+      ? `解析目标 ${result.target_address}`
+      : "";
+    setDraftProbeNotice(
+      "入口只确认本机监听状态，不测量外部网络延迟；目标毫秒仅为本机到目标的 TCP 握手。UDP 需真实双向流量验证。",
+    );
+  }
+
+  function renderDraftProbeError(message, time) {
+    setProbeCard(elements.ruleListenProbe, "bad");
+    setProbeBadge(elements.ruleListenProbeBadge, "检测失败", "bad");
+    elements.ruleListenProbeMetric.textContent = "未取得入口结果";
+    elements.ruleListenProbeMessage.textContent = message;
+    elements.ruleListenProbeTime.textContent = time;
+
+    setProbeCard(elements.ruleTargetProbe, "bad");
+    setProbeBadge(elements.ruleTargetProbeBadge, "检测失败", "bad");
+    elements.ruleTargetProbeMetric.textContent = "未取得目标结果";
+    elements.ruleTargetProbeMessage.textContent = message;
+    elements.ruleTargetProbeTime.textContent = time;
+    elements.ruleTargetProbeAddress.hidden = true;
+    elements.ruleTargetProbeAddress.textContent = "";
+    setDraftProbeNotice(message, "error");
+  }
+
+  function renderDraftProbe() {
+    const draft = state.ruleDraftProbe;
+    const loading = draft.phase === "loading";
+    elements.ruleProbe.disabled = loading || state.rulesSaving;
+    const label = $("span", elements.ruleProbe);
+    if (label) label.textContent = loading ? "检测中…" : "检测连通性";
+
+    if (loading) {
+      setProbeCard(elements.ruleListenProbe, "loading");
+      setProbeBadge(elements.ruleListenProbeBadge, "检测中…", "neutral");
+      elements.ruleListenProbeMetric.textContent = "正在检查本机监听";
+      elements.ruleListenProbeMessage.textContent = "正在检查端口绑定与当前监听状态，不会主动连接入口。";
+      elements.ruleListenProbeTime.textContent = "请求进行中";
+
+      setProbeCard(elements.ruleTargetProbe, "loading");
+      setProbeBadge(elements.ruleTargetProbeBadge, "检测中…", "neutral");
+      elements.ruleTargetProbeMetric.textContent = "正在检查目标 TCP";
+      elements.ruleTargetProbeMessage.textContent = "UDP 不使用随机测试报文，结果会明确标为未验证。";
+      elements.ruleTargetProbeTime.textContent = "请求进行中";
+      elements.ruleTargetProbeAddress.hidden = true;
+      elements.ruleTargetProbeAddress.textContent = "";
+      setDraftProbeNotice("检测只从面板所在主机发起，不能证明公网链路、应用认证或 UDP 双向流量可用。");
+      return;
+    }
+    if (draft.phase === "result" && draft.result) {
+      renderDraftProbeResult(draft.result);
+      return;
+    }
+    if (draft.phase === "error") {
+      renderDraftProbeError(draft.error || "连通性检测未能完成。", formatProbeTime(new Date().toISOString()));
+      return;
+    }
+    renderDraftProbePlaceholder(
+      draft.phase,
+      draft.phase === "invalidated"
+        ? "监听地址、目标、协议或探测相关配置已更改，旧检测结果已清除。"
+        : "",
+    );
+  }
+
+  function invalidateDraftProbeResult() {
+    const draft = state.ruleDraftProbe;
+    if (!elements.ruleDialog.open) return;
+    const hadResult = ["loading", "result", "error"].includes(draft.phase);
+    stopDraftProbeRequest();
+    draft.key = currentDraftProbeKey();
+    draft.phase = hadResult ? "invalidated" : "idle";
+    draft.result = null;
+    draft.error = "";
+    renderDraftProbe();
+  }
+
+  async function probeDraftRule() {
+    if (!elements.ruleDialog.open) return;
+    const rule = readRuleForm();
+    const validationError = validateRule(rule);
+    if (validationError) {
+      hintError(elements.ruleFormError, validationError);
+      return;
+    }
+    hintError(elements.ruleFormError, "");
+    const draft = state.ruleDraftProbe;
+    stopDraftProbeRequest();
+    const token = draft.token;
+    const key = probeCacheKey(rule);
+    const sequence = beginRuleProbe(key);
+    const controller = new AbortController();
+    draft.key = key;
+    draft.phase = "loading";
+    draft.result = null;
+    draft.error = "";
+    draft.controller = controller;
+    renderDraftProbe();
+    try {
+      const response = await api("/api/rules/probe", {
+        method: "POST",
+        body: { rule: probePayload(rule) },
+        signal: controller.signal,
+      });
+      if (draft.token !== token || !elements.ruleDialog.open) return;
+      if (currentDraftProbeKey() !== key) return;
+      const result = normalizedProbeResult(response);
+      if (!rememberRuleProbe(key, sequence, {
+        result,
+        receivedAt: result.checked_at || new Date().toISOString(),
+      })) {
+        draft.phase = "invalidated";
+        renderDraftProbe();
+        return;
+      }
+      draft.phase = "result";
+      draft.result = result;
+      draft.error = "";
+      renderDraftProbe();
+    } catch (error) {
+      if (draft.token !== token || !elements.ruleDialog.open) return;
+      if (currentDraftProbeKey() !== key) return;
+      if (!rememberRuleProbe(key, sequence, {
+        error: errorMessage(error),
+        receivedAt: new Date().toISOString(),
+      })) {
+        draft.phase = "invalidated";
+        renderDraftProbe();
+        return;
+      }
+      draft.phase = "error";
+      draft.result = null;
+      draft.error = errorMessage(error);
+      renderDraftProbe();
+    } finally {
+      if (draft.token === token) {
+        draft.controller = null;
+        if (draft.phase === "loading") {
+          draft.phase = "error";
+          draft.error = "连通性检测未能完成，请稍后重试。";
+          renderDraftProbe();
+        }
+      }
+    }
+  }
+
+  function primeDraftProbe(rule) {
+    const draft = state.ruleDraftProbe;
+    stopDraftProbeRequest();
+    draft.key = currentDraftProbeKey(rule);
+    draft.phase = "idle";
+    draft.result = null;
+    draft.error = "";
+    draft.controller = null;
+    const cached = state.ruleProbeResults.get(draft.key);
+    if (cached && cached.result) {
+      draft.phase = "result";
+      draft.result = cached.result;
+    } else if (cached && cached.error) {
+      draft.phase = "error";
+      draft.error = cached.error;
+    }
+    renderDraftProbe();
   }
 
   function openRuleDialog(index = -1) {
@@ -763,20 +1361,41 @@
     byId("rule-listen").value = rule ? rule.listen : "";
     byId("rule-target").value = rule ? rule.target : "";
     byId("rule-cidrs").value = rule ? rule.allowed_cidrs.join("\n") : "";
-    byId("rule-max-connections").value = rule ? String(rule.max_connections) : "256";
+    byId("rule-max-connections").value = rule ? String(rule.max_connections) : String(DEFAULT_MAX_CONNECTIONS);
     byId("rule-udp-timeout").value = rule ? String(rule.udp_timeout) : "60";
     const network = rule ? rule.network : "both";
     const networkInput = $(`input[name="rule-network"][value="${network}"]`, elements.ruleForm);
     if (networkInput) networkInput.checked = true;
     elements.ruleDialogTitle.textContent = rule ? "编辑转发规则" : "新建转发规则";
     hintError(elements.ruleFormError, "");
+    primeDraftProbe(rule);
     elements.ruleDialog.showModal();
     window.setTimeout(() => byId("rule-name").focus(), 20);
   }
 
   function closeRuleDialog() {
+    stopDraftProbeRequest();
+    state.ruleDraftProbe.phase = "idle";
+    state.ruleDraftProbe.result = null;
+    state.ruleDraftProbe.error = "";
     if (elements.ruleDialog.open) elements.ruleDialog.close();
     state.editingRuleIndex = -1;
+  }
+
+  function findSavedRuleForProbe(rule, previousIDs, editRuleID) {
+    if (editRuleID) {
+      const byID = state.rules.find((item) => item.id === editRuleID);
+      if (byID) return byID;
+    }
+    const matches = state.rules.filter((item) => (
+      item.name === rule.name
+      && item.network === rule.network
+      && item.listen === rule.listen
+      && item.target === rule.target
+    ));
+    return matches.find((item) => item.id && !previousIDs.has(item.id))
+      || matches[matches.length - 1]
+      || null;
   }
 
   async function submitRule(event) {
@@ -792,8 +1411,10 @@
     const label = $("span", elements.ruleSubmit);
     if (label) label.textContent = "保存中…";
 
+    const previousIDs = new Set(state.rules.map((item) => item.id).filter(Boolean));
     let candidate;
     const editIndex = state.editingRuleIndex;
+    const editRuleID = editIndex >= 0 && state.rules[editIndex] ? state.rules[editIndex].id : "";
     if (editIndex >= 0 && state.rules[editIndex]) {
       candidate = state.rules.map((item) => ({ ...item }));
       candidate[editIndex] = { ...candidate[editIndex], ...rule, id: candidate[editIndex].id || rule.id };
@@ -806,7 +1427,13 @@
         candidate,
         editIndex >= 0 ? `已保存“${rule.name}”` : `已创建“${rule.name}”`,
       );
-      if (saved) closeRuleDialog();
+      if (saved) {
+        const savedRule = findSavedRuleForProbe(rule, previousIDs, editRuleID);
+        closeRuleDialog();
+        if (savedRule) {
+          window.setTimeout(() => probeRule(savedRule, { announce: false }), 0);
+        }
+      }
     } finally {
       elements.ruleSubmit.disabled = false;
       if (label) label.textContent = "保存规则";
@@ -1308,6 +1935,9 @@
 
   function showLogin(message = "") {
     state.authenticated = false;
+    state.ruleProbeLatest.clear();
+    state.ruleProbeResults.clear();
+    state.ruleProbePending.clear();
     stopPolling();
     if (state.clockTimer) {
       window.clearInterval(state.clockTimer);
@@ -1433,6 +2063,14 @@
     elements.importFile.addEventListener("change", () => importRules(elements.importFile.files[0]));
 
     elements.ruleForm.addEventListener("submit", submitRule);
+    elements.ruleProbe.addEventListener("click", probeDraftRule);
+    ["rule-listen", "rule-target", "rule-cidrs", "rule-max-connections", "rule-udp-timeout"].forEach((id) => {
+      byId(id).addEventListener("input", invalidateDraftProbeResult);
+    });
+    $$('input[name="rule-network"]', elements.ruleForm).forEach((input) => {
+      input.addEventListener("change", invalidateDraftProbeResult);
+    });
+    byId("rule-enabled").addEventListener("change", invalidateDraftProbeResult);
     byId("rule-cancel").addEventListener("click", closeRuleDialog);
     byId("rule-cancel-x").addEventListener("click", closeRuleDialog);
     elements.ruleDialog.addEventListener("cancel", (event) => {
@@ -1528,7 +2166,9 @@
     applyTheme(preference);
     bindEvents();
     try {
+      const requestStarted = window.performance.now();
       const status = await api("/api/status", { authRedirect: false });
+      updateBrowserPanelRtt(window.performance.now() - requestStarted);
       state.status = status;
       await enterApp();
     } catch (error) {

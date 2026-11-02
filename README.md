@@ -2,7 +2,7 @@
 
 RelayDeck 是一个面向公网入口的轻量 TCP/UDP 中转面板。它工作在 L4：转发器只处理连接和字节流，不解析上层内容，因此可以直接承载 VLESS、Reality、Hysteria2、TUIC、TLS、SSH 等协议的 TCP/UDP 流量。协议自身的加密、认证和伪装仍由两端客户端/服务端完成。
 
-RelayDeck 的主动出口、代理链和隧道由可选的 sing-box 内核提供。没有安装 sing-box 时，规则转发和面板功能仍可使用。它不依赖 Nginx。
+RelayDeck 的原生 TCP/UDP 规则转发在进程内完成，无需启动 sing-box 内核。主动出口、代理链和隧道由可选的 sing-box 内核提供；没有安装 sing-box 时，规则转发和面板功能仍可使用。它不依赖 Nginx。
 
 ## 适用范围
 
@@ -12,6 +12,8 @@ RelayDeck 的主动出口、代理链和隧道由可选的 sing-box 内核提供
 - 单机、低资源 VPS，以及需要明确端口访问控制的场景。
 
 透明转发能传递协议字节，但不会保留客户端原始源 IP。TCP 和 UDP 上的协议加密会保留；依赖 UDP 的 QUIC/Hysteria2 必须配置 `udp` 或 `both` 规则。未来出现的所有新协议不能预先保证兼容，尤其当协议要求透明源地址、特殊 ICMP 行为、端口跳转或内核级路由时。
+
+每条规则的 `max_connections` 省略或设为 `0` 时采用有限默认上限 `8192`，可显式设置为 `1` 至 `65536`。已有显式值会保留，包括旧配置中的 `256`；它不会因为升级而被自动放大。API 的 `effective_max_connections` 返回最终生效值。
 
 当前 sing-box 1.14.4 的协议支持与限制见 [docs/research.md](docs/research.md)。WireGuard、SSH 等连接可以通过 L4 的 UDP/TCP 规则承载；主动 WireGuard/SSH 出口依赖引擎模板，模板能力受实际安装的内核版本约束。
 
@@ -86,6 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 ```
 
 三个支持架构的归档 SHA-256 已固定在脚本中，来源为 GitHub Release API 的资产 digest。上游没有独立的签名或 `checksums.txt`；该步骤是发布资产完整性校验，不应描述为上游数字签名验证。如果目标路径已有不同版本的 sing-box，脚本会拒绝覆盖，除非显式传入 `--force`。
+
+模板列表首项 `direct-passthrough` 是通用 TCP/UDP direct 入站到 direct 出站的配置，属于可选的 sing-box 出站隧道，不会限制原生转发规则。Reality 模板可承载配置允许的 TCP 与 UDP 流量，UDP 还要求远端支持 XUDP；Reality 不会自动转换其他协议。SSH 模板仍只承载 TCP。
 
 ## 构建
 

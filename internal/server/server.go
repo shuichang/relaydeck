@@ -40,6 +40,7 @@ type Server struct {
 	forwardError string
 	engine       *engine.Manager
 	logins       chan struct{}
+	probes       chan struct{}
 	started      time.Time
 	handler      http.Handler
 }
@@ -58,6 +59,7 @@ func New(opts Options) (*Server, error) {
 		opts: opts, cfg: c, store: store, auth: auth, sessions: newSessions(),
 		forward: forward.NewManager(), engine: engine.New(opts.DataDir, opts.EngineBinary), started: time.Now(),
 		logins: make(chan struct{}, 2),
+		probes: make(chan struct{}, 4),
 	}
 	if err = s.forward.Apply(c.Rules); err != nil {
 		s.forwardError = fmt.Sprintf("恢复转发规则失败: %v", err)
@@ -235,6 +237,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, rows)
 	case "PUT /api/rules":
 		s.putRules(w, r)
+	case "POST /api/rules/probe":
+		s.probeRule(w, r)
 	case "GET /api/engine":
 		writeJSON(w, 200, s.engineState())
 	case "GET /api/engine/templates":
@@ -300,7 +304,11 @@ func (s *Server) ruleSnapshots() []forward.Snapshot {
 	rows = make([]forward.Snapshot, 0, len(s.cfg.Rules))
 	for _, rule := range s.cfg.Rules {
 		rule.AllowedCIDRs = append([]string(nil), rule.AllowedCIDRs...)
-		row := forward.Snapshot{Rule: rule}
+		limit := rule.MaxConnections
+		if limit == 0 {
+			limit = config.DefaultMaxConnections
+		}
+		row := forward.Snapshot{Rule: rule, EffectiveMaxConnections: limit}
 		if rule.Enabled {
 			row.Error = s.forwardError
 		}
@@ -329,7 +337,7 @@ func (s *Server) putRules(w http.ResponseWriter, r *http.Request) {
 			b.Rules[i].ID = hex.EncodeToString(id)
 		}
 		if b.Rules[i].MaxConnections == 0 {
-			b.Rules[i].MaxConnections = 256
+			b.Rules[i].MaxConnections = config.DefaultMaxConnections
 		}
 		if b.Rules[i].UDPTimeout == 0 {
 			b.Rules[i].UDPTimeout = 60

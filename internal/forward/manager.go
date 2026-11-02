@@ -17,14 +17,12 @@ import (
 )
 
 const (
-	defaultMaxConnections    = 256
-	maxConfiguredConnections = 4_096
-	defaultUDPTimeout        = 60 * time.Second
-	maxUDPTimeout            = 24 * time.Hour
-	maxRuleCount             = 512
-	maxRuleIDBytes           = 128
-	maxRuleNameBytes         = 256
-	maxAllowedCIDRs          = 128
+	defaultUDPTimeout = 60 * time.Second
+	maxUDPTimeout     = 24 * time.Hour
+	maxRuleCount      = 512
+	maxRuleIDBytes    = 128
+	maxRuleNameBytes  = 256
+	maxAllowedCIDRs   = 128
 
 	targetResolveTimeout = 5 * time.Second
 	targetDialTimeout    = 10 * time.Second
@@ -39,12 +37,13 @@ var ErrClosed = errors.New("forward manager is closed")
 // Snapshot is the configured rule merged with its current runtime state.
 type Snapshot struct {
 	config.Rule
-	Running           bool   `json:"running"`
-	Error             string `json:"error"`
-	ActiveConnections int64  `json:"active_connections"`
-	BytesIn           uint64 `json:"bytes_in"`
-	BytesOut          uint64 `json:"bytes_out"`
-	UDPSessions       int64  `json:"udp_sessions"`
+	Running                 bool   `json:"running"`
+	Error                   string `json:"error"`
+	ActiveConnections       int64  `json:"active_connections"`
+	BytesIn                 uint64 `json:"bytes_in"`
+	BytesOut                uint64 `json:"bytes_out"`
+	UDPSessions             int64  `json:"udp_sessions"`
+	EffectiveMaxConnections int    `json:"effective_max_connections"`
 }
 
 // Manager owns a set of forwarding listeners. Apply operations are serialized.
@@ -150,8 +149,8 @@ func ValidateRules(rules []config.Rule) error {
 		if _, err := parseAllowedCIDRs(rule.AllowedCIDRs); err != nil {
 			return fmt.Errorf("%s: %w", prefix, err)
 		}
-		if rule.MaxConnections < 0 || rule.MaxConnections > maxConfiguredConnections {
-			return fmt.Errorf("%s: max_connections must be between 0 and %d", prefix, maxConfiguredConnections)
+		if rule.MaxConnections < 0 || rule.MaxConnections > config.MaxConnections {
+			return fmt.Errorf("%s: max_connections must be between 0 and %d", prefix, config.MaxConnections)
 		}
 		if rule.UDPTimeout < 0 || rule.UDPTimeout > int(maxUDPTimeout/time.Second) {
 			return fmt.Errorf("%s: udp_timeout must be between 0 and %d seconds", prefix, int(maxUDPTimeout/time.Second))
@@ -381,7 +380,10 @@ func (m *Manager) Snapshot() []Snapshot {
 	result := make([]Snapshot, 0, len(m.rules))
 	for _, rule := range m.rules {
 		key, _ := keyForRule(rule, len(result))
-		snapshot := Snapshot{Rule: cloneRule(rule)}
+		snapshot := Snapshot{
+			Rule:                    cloneRule(rule),
+			EffectiveMaxConnections: effectiveMaxConnections(rule),
+		}
 		if rt := m.runtime[key]; rt != nil {
 			rt.fillSnapshot(&snapshot)
 		}
@@ -669,7 +671,7 @@ func cloneRule(rule config.Rule) config.Rule {
 
 func effectiveMaxConnections(rule config.Rule) int {
 	if rule.MaxConnections == 0 {
-		return defaultMaxConnections
+		return config.DefaultMaxConnections
 	}
 	return rule.MaxConnections
 }

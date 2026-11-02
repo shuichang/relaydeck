@@ -32,6 +32,19 @@ jobs:
           cache-dependency-path: go.mod
           cache: true
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Check browser test script
+        run: node --check scripts/test-web.cjs
+
+      - name: Install browser test dependencies
+        run: |
+          npm install --no-save --package-lock=false --no-audit --no-fund playwright@1.64.1
+          npx playwright install --with-deps chromium
+
       - name: Check shell scripts
         run: |
           bash -n scripts/install.sh
@@ -50,6 +63,24 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Build browser test binary
+        run: go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/relaydeck-ui" ./cmd/relaydeck
+
+      - name: Browser UI regression
+        env:
+          RELAYDECK_BINARY: ${{ runner.temp }}/relaydeck-ui
+          RELAYDECK_UI_ARTIFACTS: ${{ runner.temp }}/relaydeck-ui-artifacts
+        run: node scripts/test-web.cjs
+
+      - name: Upload browser UI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relaydeck-browser-ui
+          path: ${{ runner.temp }}/relaydeck-ui-artifacts
+          if-no-files-found: warn
+          retention-days: 2
 
       - name: Real protocol integration
         run: |
