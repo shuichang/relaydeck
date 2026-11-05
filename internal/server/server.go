@@ -20,6 +20,7 @@ import (
 	"github.com/shuichang/relaydeck/internal/config"
 	"github.com/shuichang/relaydeck/internal/engine"
 	"github.com/shuichang/relaydeck/internal/forward"
+	"github.com/shuichang/relaydeck/internal/paneltls"
 	"github.com/shuichang/relaydeck/web"
 )
 
@@ -27,6 +28,7 @@ type Options struct {
 	DataDir      string
 	Version      string
 	EngineBinary string
+	TLS          *paneltls.Manager
 }
 
 type Server struct {
@@ -254,6 +256,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, s.cfg)
 	case "POST /api/password":
 		s.changePassword(w, r)
+	case "GET /api/settings/tls":
+		s.tlsState(w)
+	case "PUT /api/settings/tls":
+		s.putTLS(w, r)
+	case "POST /api/settings/tls/reload":
+		s.reloadTLS(w, r)
 	default:
 		fail(w, 404, "接口不存在")
 	}

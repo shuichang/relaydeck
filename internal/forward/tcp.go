@@ -106,7 +106,7 @@ func (e *tcpEndpoint) acceptLoop() {
 				break
 			}
 			if temporary, ok := err.(net.Error); ok && temporary.Temporary() {
-				e.runtime.setError(err)
+				e.runtime.setTCPError(fmt.Errorf("accept tcp: %w", err))
 				timer := time.NewTimer(backoff)
 				select {
 				case <-e.ctx.Done():
@@ -119,7 +119,7 @@ func (e *tcpEndpoint) acceptLoop() {
 				}
 				continue
 			}
-			e.runtime.setError(fmt.Errorf("accept tcp: %w", err))
+			e.runtime.setTCPListenerError(fmt.Errorf("accept tcp: %w", err))
 			break
 		}
 		backoff = 5 * time.Millisecond
@@ -132,14 +132,14 @@ func (e *tcpEndpoint) acceptLoop() {
 func (e *tcpEndpoint) admit(conn *net.TCPConn) bool {
 	remote, ok := addrFromNetAddr(conn.RemoteAddr())
 	if !ok || !e.runtime.clientAllowed(remote.Addr()) {
-		e.runtime.setError(fmt.Errorf("rejected connection from %s: source is not allowed", conn.RemoteAddr()))
+		e.runtime.setTCPError(fmt.Errorf("rejected connection from %s: source is not allowed", conn.RemoteAddr()))
 		return false
 	}
 
 	e.mu.Lock()
 	if e.closing || e.active >= e.runtime.spec.maxConns {
 		e.mu.Unlock()
-		e.runtime.setError(fmt.Errorf("connection limit reached (%d)", e.runtime.spec.maxConns))
+		e.runtime.setTCPError(fmt.Errorf("connection limit reached (%d)", e.runtime.spec.maxConns))
 		return false
 	}
 	e.active++
@@ -169,16 +169,17 @@ func (e *tcpEndpoint) handle(client *net.TCPConn) {
 	}
 	upstream, err := dialer.DialContext(e.ctx, "tcp4", e.runtime.spec.target.String())
 	if err != nil {
-		e.runtime.setError(fmt.Errorf("dial target: %w", err))
+		e.runtime.setTCPError(fmt.Errorf("dial target: %w", err))
 		return
 	}
 	upstreamTCP, ok := upstream.(*net.TCPConn)
 	if !ok {
 		_ = upstream.Close()
-		e.runtime.setError(errors.New("tcp4 dial returned a non-TCP connection"))
+		e.runtime.setTCPError(errors.New("tcp4 dial returned a non-TCP connection"))
 		return
 	}
 	defer upstreamTCP.Close()
+	e.runtime.tcpUpstreamEstablished()
 
 	proxyTCP(e.ctx, e.runtime, client, upstreamTCP)
 }

@@ -35,6 +35,8 @@
     <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol>
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10V6l8-3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></symbol>
     <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6V2Z"/><path d="M14 2v5h5M9 12h6M9 16h6"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-certificate" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M7 8h6M7 12h4M16 10v3M14.7 17.7l1.3 3 1.3-3 2 .8-1.3 3.3h-4l-1.3-3.3 2-.8Z"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></symbol>
     <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></symbol>
   </svg>
@@ -106,6 +108,11 @@
         <a class="nav-item" href="#engine" data-route="engine">
           <svg class="icon" aria-hidden="true"><use href="#i-cpu"></use></svg>
           <span>协议内核</span>
+        </a>
+        <span class="nav-label nav-label-spaced">系统</span>
+        <a class="nav-item" href="#settings" data-route="settings">
+          <svg class="icon" aria-hidden="true"><use href="#i-settings"></use></svg>
+          <span>设置</span>
         </a>
         <span class="nav-label nav-label-spaced">资源</span>
         <a class="nav-item" href="#help" data-route="help">
@@ -461,6 +468,209 @@
                 </div>
               </article>
             </aside>
+          </div>
+        </section>
+
+        <section id="view-settings" class="view" data-view="settings" hidden>
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">SETTINGS</span>
+              <h2>设置</h2>
+              <p>管理控制台访问证书、自动重载与当前 TLS 状态。</p>
+            </div>
+            <div class="heading-actions">
+              <button id="settings-refresh" class="button secondary" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                <span>刷新</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="settings-alert" class="inline-alert error page-alert" role="alert" hidden></div>
+          <div id="settings-loading" class="inline-alert settings-loading" role="status">
+            正在读取证书设置…
+          </div>
+          <section id="settings-unavailable" class="settings-unavailable" aria-labelledby="settings-unavailable-title" hidden>
+            <span class="component-mark large"><svg class="icon" aria-hidden="true"><use href="#i-certificate"></use></svg></span>
+            <div>
+              <h3 id="settings-unavailable-title">当前部署不支持在线证书管理</h3>
+              <p id="settings-unavailable-message">此模式通常用于本地不安全预览。请通过启动参数或部署配置管理 TLS 证书，并在受支持的环境中重新打开此页。</p>
+            </div>
+          </section>
+
+          <div id="settings-main" class="settings-main" hidden>
+            <div class="settings-layout">
+              <article class="panel tls-current-panel" aria-labelledby="tls-current-title">
+                <div class="panel-heading">
+                  <div>
+                    <h3 id="tls-current-title">当前证书</h3>
+                    <p id="tls-current-caption">等待证书信息</p>
+                  </div>
+                  <span id="tls-mode-badge" class="tiny-badge neutral">—</span>
+                </div>
+                <div id="tls-current-empty" class="settings-empty" hidden>当前响应未包含证书详情。</div>
+                <div id="tls-current-details">
+                  <dl class="tls-summary">
+                    <div class="tls-summary-wide">
+                      <dt>主题</dt>
+                      <dd id="tls-subject">—</dd>
+                    </div>
+                    <div class="tls-summary-wide">
+                      <dt>签发者</dt>
+                      <dd id="tls-issuer">—</dd>
+                    </div>
+                    <div>
+                      <dt>有效状态</dt>
+                      <dd><span id="tls-validity-badge" class="tiny-badge neutral">—</span></dd>
+                    </div>
+                    <div>
+                      <dt>证书来源</dt>
+                      <dd id="tls-source">—</dd>
+                    </div>
+                    <div>
+                      <dt>生效时间</dt>
+                      <dd id="tls-not-before">—</dd>
+                    </div>
+                    <div>
+                      <dt>到期时间</dt>
+                      <dd id="tls-not-after">—</dd>
+                    </div>
+                    <div class="tls-summary-wide">
+                      <dt>证书路径</dt>
+                      <dd id="tls-current-cert-path">—</dd>
+                    </div>
+                    <div class="tls-summary-wide">
+                      <dt>私钥路径</dt>
+                      <dd id="tls-current-key-path">—</dd>
+                    </div>
+                  </dl>
+                  <div class="tls-san-group">
+                    <span class="tls-label">DNS SAN</span>
+                    <div id="tls-dns-sans" class="tls-chips"><span class="tls-empty-value">—</span></div>
+                  </div>
+                  <div class="tls-san-group">
+                    <span class="tls-label">IP SAN</span>
+                    <div id="tls-ip-sans" class="tls-chips"><span class="tls-empty-value">—</span></div>
+                  </div>
+                  <div class="tls-fingerprint">
+                    <span class="tls-label">SHA-256 指纹</span>
+                    <code id="tls-fingerprint">—</code>
+                  </div>
+                  <div class="tls-meta-grid">
+                    <div>
+                      <span class="tls-label">自动重载</span>
+                      <strong id="tls-auto-reload">—</strong>
+                    </div>
+                    <div>
+                      <span class="tls-label">最近更新</span>
+                      <strong id="tls-updated-at">—</strong>
+                    </div>
+                  </div>
+                  <div id="tls-reload-error" class="inline-alert error" role="alert" hidden></div>
+                  <p id="tls-server-message" class="settings-server-message" hidden></p>
+                </div>
+              </article>
+
+              <article class="panel tls-editor-panel" aria-labelledby="tls-editor-title">
+                <div class="panel-heading">
+                  <div>
+                    <h3 id="tls-editor-title">证书来源</h3>
+                    <p>私钥只会提交给当前服务，读取接口不会返回私钥。</p>
+                  </div>
+                  <span id="tls-draft-badge" class="tiny-badge neutral" hidden>未保存</span>
+                </div>
+                <form id="tls-form" class="tls-form" novalidate>
+                  <fieldset class="field">
+                    <legend>配置方式</legend>
+                    <div class="segmented tls-mode-options">
+                      <label><input type="radio" name="tls-mode" value="default"><span>启动默认</span></label>
+                      <label><input type="radio" name="tls-mode" value="pem"><span>粘贴 PEM</span></label>
+                      <label><input type="radio" name="tls-mode" value="files"><span>服务器文件</span></label>
+                      <label><input type="radio" name="tls-mode" value="self_signed"><span>自签证书</span></label>
+                    </div>
+                  </fieldset>
+
+                  <section id="tls-mode-default" class="tls-mode-panel" data-tls-panel="default" hidden>
+                    <div class="tls-mode-copy">
+                      <strong>恢复启动默认</strong>
+                      <p>移除面板内保存的证书覆盖，改用启动参数或部署配置提供的默认证书。</p>
+                    </div>
+                  </section>
+
+                  <section id="tls-mode-pem" class="tls-mode-panel" data-tls-panel="pem" hidden>
+                    <label class="field">
+                      <span>证书 PEM</span>
+                      <textarea id="tls-certificate-pem" class="pem-input" rows="6" spellcheck="false" autocomplete="off" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+                      <small>支持完整证书链。也可以从本地选择证书文件后继续编辑。</small>
+                    </label>
+                    <label class="file-pick">
+                      <span>载入证书文件</span>
+                      <input id="tls-certificate-file" type="file" accept=".pem,.crt,.cer,application/x-pem-file,text/plain">
+                    </label>
+                    <label class="field">
+                      <span>私钥 PEM</span>
+                      <textarea id="tls-private-key-pem" class="pem-input" rows="6" spellcheck="false" autocomplete="off" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+                      <small>私钥只随保存请求写入服务端，成功后立即从页面清空。</small>
+                    </label>
+                    <label class="file-pick">
+                      <span>载入私钥文件</span>
+                      <input id="tls-private-key-file" type="file" accept=".pem,.key,application/x-pem-file,text/plain">
+                    </label>
+                  </section>
+
+                  <section id="tls-mode-files" class="tls-mode-panel" data-tls-panel="files" hidden>
+                    <label class="field">
+                      <span>证书文件路径</span>
+                      <input id="tls-cert-path" class="mono" type="text" spellcheck="false" autocomplete="off" placeholder="/etc/letsencrypt/live/example.com/fullchain.pem">
+                    </label>
+                    <label class="field">
+                      <span>私钥文件路径</span>
+                      <input id="tls-key-path-input" class="mono" type="text" spellcheck="false" autocomplete="off" placeholder="/etc/letsencrypt/live/example.com/privkey.pem">
+                      <small>服务器会检查文件并定时检测续期；实际私钥内容不会返回浏览器。systemd 保护可能使 <code>/root</code> 下的路径不可读，请先把证书放到服务可访问的目录。</small>
+                    </label>
+                  </section>
+
+                  <section id="tls-mode-self-signed" class="tls-mode-panel" data-tls-panel="self_signed" hidden>
+                    <div class="form-grid two tls-self-signed-grid">
+                      <label class="field">
+                        <span>域名或 IP</span>
+                        <textarea id="tls-self-signed-hosts" rows="4" spellcheck="false" autocomplete="off" placeholder="relay.example.com&#10;203.0.113.10&#10;::1"></textarea>
+                        <small>每行或逗号分隔，可同时填写域名和 IP。</small>
+                      </label>
+                      <label class="field">
+                        <span>有效天数</span>
+                        <input id="tls-self-signed-days" type="number" min="1" max="3650" step="1" value="365" inputmode="numeric">
+                        <small>建议选择覆盖使用期的天数，范围 1–3650 天。</small>
+                      </label>
+                    </div>
+                  </section>
+
+                  <div id="tls-form-error" class="inline-alert error" role="alert" hidden></div>
+                  <div class="tls-actions">
+                    <button id="tls-refresh" class="button secondary" type="button">
+                      <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                      <span>刷新</span>
+                    </button>
+                    <button id="tls-reload" class="button secondary" type="button">
+                      <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                      <span>重新载入文件证书</span>
+                    </button>
+                    <button id="tls-save" class="button primary" type="submit">
+                      <svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg>
+                      <span>保存并立即生效</span>
+                    </button>
+                  </div>
+                </form>
+              </article>
+            </div>
+
+            <article class="info-note warning-note tls-browser-note">
+              <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
+              <div>
+                <strong>浏览器访问提示</strong>
+                <p>上传、粘贴或生成的新证书需通过 SAN 匹配的域名或 IP 访问；当前页面域名不受证书校验约束。自签证书更换后，浏览器可能要求重新确认信任。公网 CA 证书请保持系统时间准确。</p>
+              </div>
+            </article>
           </div>
         </section>
 

@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.4
+  | bash -s -- --version v0.1.5
 ```
 
 首次安装会：
@@ -79,6 +79,16 @@ systemd 单元启用了文件系统、设备、内核、命名空间、系统调
 安装器不会替你开放公网端口。请自行确认云安全组或主机防火墙允许管理端口 `9443/TCP`，以及规则实际使用的 TCP/UDP 端口。不要把管理面板直接暴露给无关来源；优先限制管理端口的来源 IP。
 
 更多操作说明见 [docs/operations.md](docs/operations.md)。
+
+## 面板设置与 HTTPS 证书
+
+登录后进入“设置 → SSL 证书”，可以上传或粘贴 PEM 证书链与私钥、指定服务器上的证书/私钥路径、生成包含 IP 或域名的自签证书，或恢复启动参数指定的默认证书。证书与私钥匹配、有效期和证书链校验通过并保存成功后，新连接立即使用新证书，不需要重启面板或转发规则。
+
+文件路径模式每 60 秒检查续期后的文件，也可手动重新载入。读取失败、证书过期或私钥尚未更新时，会继续使用上一次有效证书并显示错误；重新启动也保留这份备份。TLS 设置保存在 `/var/lib/relaydeck/tls-settings.json`，权限 `0600`，不包含在普通规则配置导出中。私钥只允许提交，不会通过设置查询接口回显。
+
+公共 CA 证书须通过证书 SAN 中匹配的域名/IP 访问；自签证书更换后可能需要重新确认浏览器信任。当前设置页提供已有证书的配置和续期文件重载，不代办 ACME 申请。文件路径必须能被服务读取，systemd 默认隐藏 `/root` 等用户目录；可使用 `/etc/letsencrypt` 或应用数据目录下的文件。
+
+规则列表会分别显示当前错误和带时间的最近错误记录。TCP 上游连接恢复后清除 TCP 当前错误；UDP 必须收到目标真实回复才标记恢复，两种协议的状态独立。大字号规则名称、地址、状态和检测结果方便桌面与手机查看。
 
 ## 可选 sing-box 内核
 

@@ -2,19 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -25,6 +18,7 @@ import (
 	"time"
 
 	"github.com/shuichang/relaydeck/internal/config"
+	"github.com/shuichang/relaydeck/internal/paneltls"
 	"github.com/shuichang/relaydeck/internal/server"
 )
 
@@ -112,7 +106,15 @@ func serve(args []string) error {
 			return errors.New("--insecure-local 只允许 IP 回环监听地址")
 		}
 	}
-	s, err := server.New(server.Options{DataDir: *dir, Version: version, EngineBinary: *engine})
+	var tlsManager *paneltls.Manager
+	var err error
+	if !*localHTTP {
+		tlsManager, err = paneltls.New(paneltls.Options{DataDir: *dir, DefaultCertFile: *cert, DefaultKeyFile: *key})
+		if err != nil {
+			return fmt.Errorf("TLS 证书不可用（可使用 relaydeck certificate 创建）: %w", err)
+		}
+	}
+	s, err := server.New(server.Options{DataDir: *dir, Version: version, EngineBinary: *engine, TLS: tlsManager})
 	if err != nil {
 		return err
 	}
@@ -122,19 +124,18 @@ func serve(args []string) error {
 		ReadTimeout: 15 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 16 << 10, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 	}
-	if !*localHTTP {
-		if _, err = tls.LoadX509KeyPair(*cert, *key); err != nil {
-			return fmt.Errorf("TLS 证书不可用（可使用 relaydeck certificate 创建）: %w", err)
-		}
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if tlsManager != nil {
+		h.TLSConfig.GetCertificate = tlsManager.GetCertificate
+		go tlsManager.Run(ctx)
+	}
 	done := make(chan error, 1)
 	go func() {
 		if *localHTTP {
 			done <- h.ListenAndServe()
 		} else {
-			done <- h.ListenAndServeTLS(*cert, *key)
+			done <- h.ListenAndServeTLS("", "")
 		}
 	}()
 	scheme := "https"
@@ -178,42 +179,14 @@ func certificate(args []string) error {
 			return fmt.Errorf("%s 已存在，覆盖需要 --force", p)
 		}
 	}
-	private, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	certPEM, keyPEM, err := paneltls.GenerateSelfSigned(strings.Split(*hosts, ","), *days)
 	if err != nil {
 		return err
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
+	if err = config.WritePrivate(*key, keyPEM); err != nil {
 		return err
 	}
-	template := &x509.Certificate{
-		SerialNumber: serial, Subject: pkix.Name{CommonName: "RelayDeck"},
-		NotBefore: time.Now().Add(-5 * time.Minute), NotAfter: time.Now().Add(time.Duration(*days) * 24 * time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	for _, host := range strings.Split(*hosts, ",") {
-		host = strings.TrimSpace(host)
-		if ip := net.ParseIP(host); ip != nil {
-			template.IPAddresses = append(template.IPAddresses, ip)
-		} else if host != "" && len(host) <= 253 && !strings.ContainsAny(host, " /\\\n\r\t:") {
-			template.DNSNames = append(template.DNSNames, host)
-		} else {
-			return fmt.Errorf("无效证书主机 %q", host)
-		}
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &private.PublicKey, private)
-	if err != nil {
-		return err
-	}
-	privateDER, err := x509.MarshalPKCS8PrivateKey(private)
-	if err != nil {
-		return err
-	}
-	if err = config.WritePrivate(*key, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})); err != nil {
-		return err
-	}
-	if err = config.WritePrivate(*cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})); err != nil {
+	if err = config.WritePrivate(*cert, certPEM); err != nil {
 		return err
 	}
 	fmt.Println("已生成自签名证书；公网浏览器首次访问需要确认或导入信任。")

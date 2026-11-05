@@ -7,4 +7,5 @@ node_modules/
 *.log
 coverage.out
 relaydeck.json
+tls-settings.json
 relaydeck-data/

@@ -5,11 +5,19 @@
     overview: ["概览", "实时掌握转发节点与内核状态"],
     rules: ["转发规则", "管理监听端口、目标与访问限制"],
     engine: ["协议内核", "配置并运行可选 sing-box 内核"],
+    settings: ["设置", "管理 SSL 证书与自动重载"],
     help: ["使用帮助", "规则、安全与运行说明"],
   };
   const POLL_INTERVAL = 8000;
   const THEME_KEY = "relaydeck-theme";
   const SAFE_NETWORKS = new Set(["tcp", "udp", "both"]);
+  const TLS_MODES = new Set(["default", "pem", "files", "self_signed"]);
+  const TLS_MODE_LABELS = {
+    default: "启动默认",
+    pem: "PEM 配置",
+    files: "服务器文件",
+    self_signed: "自签证书",
+  };
   const SAFE_PROBE_STATUSES = new Set(["listening", "available", "reachable", "error", "unverified"]);
   const DEFAULT_MAX_CONNECTIONS = 8192;
   const MAX_CONNECTIONS = 65536;
@@ -52,6 +60,14 @@
     engineInstallRequestError: "",
     engineRequestEpoch: 0,
     engineRequestSequence: 0,
+    settings: null,
+    settingsLoaded: false,
+    settingsLoading: false,
+    settingsSaving: false,
+    settingsReloading: false,
+    settingsDirty: false,
+    settingsRequestEpoch: 0,
+    settingsRequestSequence: 0,
     templates: [],
     templatesLoaded: false,
     pollTimer: null,
@@ -136,6 +152,45 @@
     engineStop: byId("engine-stop"),
     engineDirty: byId("engine-dirty"),
     engineLogs: byId("engine-logs"),
+    settingsAlert: byId("settings-alert"),
+    settingsLoading: byId("settings-loading"),
+    settingsUnavailable: byId("settings-unavailable"),
+    settingsUnavailableMessage: byId("settings-unavailable-message"),
+    settingsMain: byId("settings-main"),
+    settingsRefresh: byId("settings-refresh"),
+    tlsCurrentCaption: byId("tls-current-caption"),
+    tlsModeBadge: byId("tls-mode-badge"),
+    tlsCurrentEmpty: byId("tls-current-empty"),
+    tlsCurrentDetails: byId("tls-current-details"),
+    tlsSubject: byId("tls-subject"),
+    tlsIssuer: byId("tls-issuer"),
+    tlsValidityBadge: byId("tls-validity-badge"),
+    tlsSource: byId("tls-source"),
+    tlsNotBefore: byId("tls-not-before"),
+    tlsNotAfter: byId("tls-not-after"),
+    tlsCertPath: byId("tls-current-cert-path"),
+    tlsKeyPath: byId("tls-current-key-path"),
+    tlsDnsSans: byId("tls-dns-sans"),
+    tlsIpSans: byId("tls-ip-sans"),
+    tlsFingerprint: byId("tls-fingerprint"),
+    tlsAutoReload: byId("tls-auto-reload"),
+    tlsUpdatedAt: byId("tls-updated-at"),
+    tlsReloadError: byId("tls-reload-error"),
+    tlsServerMessage: byId("tls-server-message"),
+    tlsDraftBadge: byId("tls-draft-badge"),
+    tlsForm: byId("tls-form"),
+    tlsFormError: byId("tls-form-error"),
+    tlsRefresh: byId("tls-refresh"),
+    tlsReload: byId("tls-reload"),
+    tlsSave: byId("tls-save"),
+    tlsCertificatePem: byId("tls-certificate-pem"),
+    tlsPrivateKeyPem: byId("tls-private-key-pem"),
+    tlsCertificateFile: byId("tls-certificate-file"),
+    tlsPrivateKeyFile: byId("tls-private-key-file"),
+    tlsCertPathInput: byId("tls-cert-path"),
+    tlsKeyPathInput: byId("tls-key-path-input"),
+    tlsSelfSignedHosts: byId("tls-self-signed-hosts"),
+    tlsSelfSignedDays: byId("tls-self-signed-days"),
     toastRegion: byId("toast-region"),
     themeToggle: byId("theme-toggle"),
   };
@@ -620,6 +675,15 @@
       bytes_in: numberOrNull(rule.bytes_in) || 0,
       bytes_out: numberOrNull(rule.bytes_out) || 0,
       error: typeof rule.error === "string" ? rule.error : "",
+      error_network: SAFE_NETWORKS.has(rule.error_network)
+        ? rule.error_network
+        : "",
+      last_error: typeof rule.last_error === "string" ? rule.last_error : "",
+      last_error_at: typeof rule.last_error_at === "string" ? rule.last_error_at : "",
+      last_recovery_at: typeof rule.last_recovery_at === "string" ? rule.last_recovery_at : "",
+      last_error_network: SAFE_NETWORKS.has(rule.last_error_network)
+        ? rule.last_error_network
+        : "",
       running: Boolean(rule.running),
       udp_sessions: numberOrNull(rule.udp_sessions) || 0,
     };
@@ -852,28 +916,101 @@
     }
   }
 
+  function formatRuleEventTime(value) {
+    const date = value ? new Date(value) : null;
+    if (!date || !Number.isFinite(date.getTime())) return "";
+    return new Intl.DateTimeFormat("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
+
+  function runtimeNetworkLabel(network) {
+    if (network === "tcp") return "TCP";
+    if (network === "udp") return "UDP";
+    if (network === "both") return "TCP/UDP";
+    return "";
+  }
+
+  function makeRuntimeHistory(rule) {
+    if (rule.error || !rule.last_error) return null;
+    const history = createElement("div", "rule-history");
+    const heading = createElement("span", "rule-history-heading");
+    const network = runtimeNetworkLabel(rule.last_error_network);
+    heading.append(createElement("strong", "", `最近错误${network ? `（${network}）` : ""}`));
+    const errorTime = formatRuleEventTime(rule.last_error_at);
+    if (errorTime) heading.append(document.createTextNode(` · ${errorTime}`));
+    history.append(heading);
+
+    const errorTimestamp = Date.parse(rule.last_error_at);
+    const recoveryTimestamp = Date.parse(rule.last_recovery_at);
+    const recoveryIsNewer = Number.isFinite(errorTimestamp) &&
+      Number.isFinite(recoveryTimestamp) &&
+      recoveryTimestamp >= errorTimestamp;
+    const recoveryTime = formatRuleEventTime(rule.last_recovery_at);
+    if (recoveryTime && recoveryIsNewer) {
+      history.append(createElement("span", "rule-history-recovery", `已恢复 · ${recoveryTime}`));
+    } else if (recoveryTime) {
+      history.append(createElement(
+        "span",
+        "rule-history-pending",
+        "历史记录，当前目标需重新检测",
+      ));
+    } else if (rule.last_error_network === "udp") {
+      history.append(createElement(
+        "span",
+        "rule-history-pending",
+        "UDP 恢复尚待真实回包确认",
+      ));
+    } else {
+      history.append(createElement("span", "rule-history-pending", "恢复时间未记录"));
+    }
+    history.append(createElement("span", "rule-history-message", rule.last_error));
+    return history;
+  }
+
   function makeRuntime(rule) {
     const wrapper = createElement("div", "runtime");
+    const hasCurrentError = Boolean(rule.error);
+    const network = runtimeNetworkLabel(rule.error_network);
     const runtimeState = createElement(
       "span",
-      `runtime-state ${rule.running ? "ok" : rule.error ? "bad" : ""}`,
+      `runtime-state ${rule.running ? "ok" : hasCurrentError ? "bad" : ""}${rule.running && hasCurrentError ? " has-error" : ""}`,
     );
     runtimeState.append(createElement(
       "span",
       "status-dot",
     ));
     const dot = $(".status-dot", runtimeState);
-    if (dot && rule.running) dot.classList.add("ok");
-    if (dot && rule.error) dot.classList.add("bad");
+    if (dot && rule.running && !hasCurrentError) dot.classList.add("ok");
+    if (dot && rule.running && hasCurrentError) dot.classList.add("warn");
+    if (dot && !rule.running && hasCurrentError) dot.classList.add("bad");
     runtimeState.append(document.createTextNode(
-      rule.running ? "运行中" : rule.error ? "启动异常" : rule.enabled ? "等待启动" : "已停用",
+      rule.running
+        ? hasCurrentError ? "运行中 · 当前错误" : "运行中"
+        : hasCurrentError ? "启动异常" : rule.enabled ? "等待启动" : "已停用",
     ));
     wrapper.append(runtimeState);
     const traffic = rule.network === "udp"
       ? `会话 ${formatNumber(rule.udp_sessions)} · ↑ ${formatBytes(rule.bytes_in)} · ↓ ${formatBytes(rule.bytes_out)}`
       : `连接 ${formatNumber(rule.active_connections)} · ↑ ${formatBytes(rule.bytes_in)} · ↓ ${formatBytes(rule.bytes_out)}`;
     wrapper.append(createElement("small", "", traffic));
-    if (rule.error) wrapper.append(createElement("span", "rule-error", rule.error));
+    if (hasCurrentError) {
+      const current = createElement("div", "rule-current-error");
+      current.append(createElement(
+        "strong",
+        "",
+        `当前错误${network ? `（${network}）` : ""}`,
+      ));
+      current.append(createElement("span", "", rule.error));
+      wrapper.append(current);
+    } else {
+      const history = makeRuntimeHistory(rule);
+      if (history) wrapper.append(history);
+    }
     return wrapper;
   }
 
@@ -2152,6 +2289,481 @@
     }
   }
 
+  function formatTLSDate(value) {
+    const date = value ? new Date(value) : null;
+    if (!date || !Number.isFinite(date.getTime())) return "—";
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  }
+
+  function normalizedTLSCertificate(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return {
+      subject: typeof value.subject === "string" ? value.subject : "",
+      issuer: typeof value.issuer === "string" ? value.issuer : "",
+      dns_names: Array.isArray(value.dns_names)
+        ? value.dns_names.filter((item) => typeof item === "string" && item)
+        : [],
+      ip_addresses: Array.isArray(value.ip_addresses)
+        ? value.ip_addresses.filter((item) => typeof item === "string" && item)
+        : [],
+      not_before: typeof value.not_before === "string" ? value.not_before : "",
+      not_after: typeof value.not_after === "string" ? value.not_after : "",
+      fingerprint_sha256: typeof value.fingerprint_sha256 === "string"
+        ? value.fingerprint_sha256
+        : "",
+      self_signed: value.self_signed === true,
+      valid_now: value.valid_now === true,
+    };
+  }
+
+  function normalizedTLSSettings(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new ApiError("证书设置接口返回格式无效。", 0);
+    }
+    return {
+      available: value.available === true,
+      mode: TLS_MODES.has(value.mode) ? value.mode : "default",
+      certificate: normalizedTLSCertificate(value.certificate),
+      cert_path: typeof value.cert_path === "string" ? value.cert_path : "",
+      key_path: typeof value.key_path === "string" ? value.key_path : "",
+      auto_reload_seconds: Number.isFinite(Number(value.auto_reload_seconds))
+        ? Math.max(0, Math.floor(Number(value.auto_reload_seconds)))
+        : 0,
+      reload_error: typeof value.reload_error === "string" ? value.reload_error : "",
+      updated_at: typeof value.updated_at === "string" ? value.updated_at : "",
+      message: typeof value.message === "string" ? value.message : "",
+    };
+  }
+
+  function selectedTLSMode() {
+    const selected = $('input[name="tls-mode"]:checked', elements.tlsForm);
+    return selected && TLS_MODES.has(selected.value) ? selected.value : "default";
+  }
+
+  function syncTLSModePanels() {
+    const mode = selectedTLSMode();
+    $$("[data-tls-panel]", elements.tlsForm).forEach((panel) => {
+      panel.hidden = panel.dataset.tlsPanel !== mode;
+    });
+  }
+
+  function setTLSMode(mode) {
+    const safeMode = TLS_MODES.has(mode) ? mode : "default";
+    const input = $(`input[name="tls-mode"][value="${safeMode}"]`, elements.tlsForm);
+    if (input) input.checked = true;
+    syncTLSModePanels();
+  }
+
+  function setSettingsDirty(dirty) {
+    state.settingsDirty = Boolean(dirty);
+    elements.tlsDraftBadge.hidden = !state.settingsDirty;
+  }
+
+  function setTLSValue(node, value) {
+    if (node) node.value = value || "";
+  }
+
+  function clearTLSFileInputs() {
+    if (elements.tlsCertificateFile) elements.tlsCertificateFile.value = "";
+    if (elements.tlsPrivateKeyFile) elements.tlsPrivateKeyFile.value = "";
+  }
+
+  function clearTLSSecrets() {
+    setTLSValue(elements.tlsCertificatePem, "");
+    setTLSValue(elements.tlsPrivateKeyPem, "");
+    clearTLSFileInputs();
+  }
+
+  function resetTLSForm() {
+    if (!elements.tlsForm) return;
+    elements.tlsForm.reset();
+    clearTLSSecrets();
+    hintError(elements.tlsFormError, "");
+    setSettingsDirty(false);
+    syncTLSModePanels();
+  }
+
+  function populateTLSForm(settings) {
+    if (!settings || !settings.available) return;
+    setTLSMode(settings.mode);
+    setTLSValue(elements.tlsCertPathInput, settings.cert_path);
+    setTLSValue(elements.tlsKeyPathInput, settings.key_path);
+    const certificate = settings.certificate;
+    if (settings.mode === "self_signed" && certificate) {
+      setTLSValue(
+        elements.tlsSelfSignedHosts,
+        [...certificate.dns_names, ...certificate.ip_addresses].join("\n"),
+      );
+    }
+    clearTLSSecrets();
+    setTLSValue(elements.tlsSelfSignedDays, elements.tlsSelfSignedDays.value || "365");
+    hintError(elements.tlsFormError, "");
+    setSettingsDirty(false);
+  }
+
+  function renderTLSChips(container, values) {
+    container.replaceChildren();
+    if (!Array.isArray(values) || values.length === 0) {
+      container.append(createElement("span", "tls-empty-value", "未声明"));
+      return;
+    }
+    values.forEach((value) => container.append(createElement("code", "tls-chip", value)));
+  }
+
+  function tlsSourceText(settings, certificate) {
+    if (settings.mode === "files") {
+      return "服务器文件 · 自动检测续期";
+    }
+    if (settings.mode === "pem") {
+      return "面板内 PEM · 私钥不回传";
+    }
+    if (settings.mode === "self_signed") {
+      return "RelayDeck 自签证书";
+    }
+    if (certificate && certificate.self_signed) return "启动默认 · 自签证书";
+    return "启动默认或部署配置";
+  }
+
+  function updateTLSControls() {
+    const available = Boolean(state.settings && state.settings.available);
+    const busy = state.settingsLoading || state.settingsSaving || state.settingsReloading;
+    const currentMode = state.settings ? state.settings.mode : "";
+    const editControls = elements.tlsForm
+      ? $$("input, textarea", elements.tlsForm)
+      : [];
+    editControls.forEach((control) => {
+      control.disabled = !available || busy;
+    });
+    elements.tlsSave.disabled = !available || busy;
+    const fileBacked = currentMode === "files" || currentMode === "default";
+    elements.tlsReload.disabled = !available || busy || !fileBacked;
+    elements.tlsRefresh.disabled = busy;
+    elements.settingsRefresh.disabled = busy;
+    elements.tlsSave.title = available
+      ? "将当前来源的证书写入服务端并立即生效。"
+      : "当前部署不支持在线证书管理。";
+    elements.tlsReload.title = fileBacked
+      ? "重新读取当前配置的证书与私钥文件。"
+      : "当前生效来源为启动默认或服务器文件时，可重新载入文件证书。";
+    const saveLabel = $("span", elements.tlsSave);
+    const reloadLabel = $("span", elements.tlsReload);
+    if (saveLabel) saveLabel.textContent = state.settingsSaving ? "保存并应用…" : "保存并立即生效";
+    if (reloadLabel) reloadLabel.textContent = state.settingsReloading ? "重新载入中…" : "重新载入文件证书";
+  }
+
+  function renderTLSSettings(settings, { syncForm = false } = {}) {
+    state.settings = settings;
+    elements.settingsLoading.hidden = true;
+    elements.settingsUnavailable.hidden = settings.available;
+    elements.settingsMain.hidden = !settings.available;
+
+    if (!settings.available) {
+      elements.settingsUnavailableMessage.textContent = settings.message
+        || "此模式通常用于本地不安全预览。请通过启动参数或部署配置管理 TLS 证书，并在受支持的环境中重新打开此页。";
+      updateTLSControls();
+      return;
+    }
+
+    const certificate = settings.certificate;
+    const modeLabel = TLS_MODE_LABELS[settings.mode] || "未知来源";
+    setBadge(elements.tlsModeBadge, modeLabel, settings.mode === "default" ? "neutral" : "");
+    elements.tlsCurrentCaption.textContent = certificate
+      ? `${modeLabel}${certificate.self_signed ? " · 自签" : ""}`
+      : `${modeLabel} · 未返回证书详情`;
+    elements.tlsCurrentEmpty.hidden = Boolean(certificate);
+    elements.tlsCurrentDetails.hidden = !certificate;
+
+    if (certificate) {
+      elements.tlsSubject.textContent = certificate.subject || "—";
+      elements.tlsIssuer.textContent = certificate.issuer || "—";
+      elements.tlsValidityBadge.textContent = certificate.valid_now ? "有效" : "已过期或尚未生效";
+      elements.tlsValidityBadge.className = `tiny-badge ${certificate.valid_now ? "" : "bad"}`;
+      elements.tlsSource.textContent = tlsSourceText(settings, certificate);
+      elements.tlsNotBefore.textContent = formatTLSDate(certificate.not_before);
+      elements.tlsNotAfter.textContent = formatTLSDate(certificate.not_after);
+      elements.tlsFingerprint.textContent = certificate.fingerprint_sha256 || "—";
+      renderTLSChips(elements.tlsDnsSans, certificate.dns_names);
+      renderTLSChips(elements.tlsIpSans, certificate.ip_addresses);
+    }
+    elements.tlsCertPath.textContent = settings.cert_path || "未提供";
+    elements.tlsKeyPath.textContent = settings.key_path || (
+      settings.mode === "pem" ? "私钥由服务端保存，读取接口不返回" : "未提供"
+    );
+    elements.tlsAutoReload.textContent = settings.auto_reload_seconds > 0
+      ? `每 ${formatNumber(settings.auto_reload_seconds)} 秒检测并重载`
+      : "关闭";
+    elements.tlsUpdatedAt.textContent = formatTLSDate(settings.updated_at);
+    hintError(elements.tlsReloadError, settings.reload_error);
+    elements.tlsServerMessage.textContent = settings.message || "";
+    elements.tlsServerMessage.hidden = !settings.message;
+
+    if (syncForm && !state.settingsDirty) populateTLSForm(settings);
+    updateTLSControls();
+  }
+
+  function isCurrentSettingsRequest(epoch, sequence) {
+    return state.authenticated &&
+      epoch === state.settingsRequestEpoch &&
+      sequence === state.settingsRequestSequence;
+  }
+
+  function invalidateSettingsRequests() {
+    state.settingsRequestEpoch += 1;
+    state.settingsRequestSequence += 1;
+    state.settingsLoading = false;
+  }
+
+  async function loadSettings({ silent = false, syncForm = true } = {}) {
+    if (
+      state.settingsLoading ||
+      state.settingsSaving ||
+      state.settingsReloading ||
+      !state.authenticated
+    ) {
+      return false;
+    }
+    const requestEpoch = state.settingsRequestEpoch;
+    const requestSequence = ++state.settingsRequestSequence;
+    state.settingsLoading = true;
+    elements.settingsLoading.hidden = false;
+    if (!silent) hintError(elements.settingsAlert, "");
+    updateTLSControls();
+    try {
+      const payload = await api("/api/settings/tls", { authRedirect: false });
+      if (!isCurrentSettingsRequest(requestEpoch, requestSequence)) return false;
+      const settings = normalizedTLSSettings(payload);
+      state.settingsLoading = false;
+      state.settingsLoaded = true;
+      renderTLSSettings(settings, {
+        syncForm: syncForm && !state.settingsDirty,
+      });
+      if (!silent && state.settingsDirty) {
+        showToast("已刷新证书状态，未保存的编辑已保留。");
+      }
+      return true;
+    } catch (error) {
+      if (!isCurrentSettingsRequest(requestEpoch, requestSequence)) return false;
+      if (error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
+      if (!silent) {
+        hintError(elements.settingsAlert, errorMessage(error));
+        showToast(`证书设置读取失败：${errorMessage(error)}`, "error", 6500);
+      }
+      return false;
+    } finally {
+      if (isCurrentSettingsRequest(requestEpoch, requestSequence)) {
+        state.settingsLoading = false;
+        elements.settingsLoading.hidden = true;
+        updateTLSControls();
+      }
+    }
+  }
+
+  function readTLSHosts() {
+    const hosts = elements.tlsSelfSignedHosts.value
+      .split(/[\n,]+/)
+      .map((host) => host.trim().replace(/^\[([^\]]+)\]$/, "$1"))
+      .filter(Boolean);
+    const unique = [...new Set(hosts)];
+    if (unique.length === 0) throw new Error("请至少填写一个域名或 IP。");
+    if (unique.length > 64) throw new Error("单次最多生成 64 个域名或 IP。");
+    const invalid = unique.find((host) => /[\s/?#]/.test(host) || host.includes("://"));
+    if (invalid) throw new Error(`“${invalid}”不是有效的域名或 IP，请去掉协议和路径。`);
+    return unique;
+  }
+
+  function readTLSPayload() {
+    const mode = selectedTLSMode();
+    if (mode === "default") return { mode: "default" };
+    if (mode === "pem") {
+      const certificatePEM = elements.tlsCertificatePem.value;
+      const privateKeyPEM = elements.tlsPrivateKeyPem.value;
+      if (!certificatePEM.trim() || !privateKeyPEM.trim()) {
+        throw new Error("请同时粘贴或载入证书与私钥 PEM。");
+      }
+      return {
+        mode: "pem",
+        certificate_pem: certificatePEM,
+        private_key_pem: privateKeyPEM,
+      };
+    }
+    if (mode === "files") {
+      const certPath = elements.tlsCertPathInput.value.trim();
+      const keyPath = elements.tlsKeyPathInput.value.trim();
+      if (!certPath || !keyPath) throw new Error("请填写服务器上的证书文件和私钥文件路径。");
+      return { mode: "files", cert_path: certPath, key_path: keyPath };
+    }
+    const days = Number(elements.tlsSelfSignedDays.value);
+    if (!Number.isInteger(days) || days < 1 || days > 3650) {
+      throw new Error("自签证书有效天数必须是 1 到 3650 之间的整数。");
+    }
+    return {
+      mode: "self_signed",
+      hosts: readTLSHosts(),
+      days,
+    };
+  }
+
+  function tlsSuccessMessage(mode, certificate) {
+    if (mode === "self_signed") {
+      return "自签证书已生成并生效。浏览器可能要求重新确认信任，请使用证书覆盖的域名或 IP 访问。";
+    }
+    if (mode === "files") {
+      return "文件证书已保存并立即生效，服务会自动检测证书续期。";
+    }
+    if (mode === "pem") {
+      return "PEM 证书已保存并立即生效；私钥输入已从页面清空。";
+    }
+    if (certificate && certificate.self_signed) {
+      return "已恢复启动默认证书。浏览器可能需要重新确认信任。";
+    }
+    return "已恢复启动默认证书并立即生效。";
+  }
+
+  async function submitTLSSettings(event) {
+    event.preventDefault();
+    if (!state.settings || !state.settings.available) return false;
+    if (state.settingsSaving || state.settingsReloading) return false;
+    let body;
+    try {
+      body = readTLSPayload();
+    } catch (error) {
+      hintError(elements.tlsFormError, error.message);
+      return false;
+    }
+
+    hintError(elements.tlsFormError, "");
+    hintError(elements.settingsAlert, "");
+    state.settingsSaving = true;
+    invalidateSettingsRequests();
+    const requestEpoch = state.settingsRequestEpoch;
+    const requestSequence = ++state.settingsRequestSequence;
+    updateTLSControls();
+    try {
+      const payload = await api("/api/settings/tls", {
+        method: "PUT",
+        authRedirect: false,
+        body,
+      });
+      if (!isCurrentSettingsRequest(requestEpoch, requestSequence)) return false;
+      const settings = normalizedTLSSettings(payload);
+      state.settingsSaving = false;
+      state.settingsLoaded = true;
+      clearTLSSecrets();
+      setSettingsDirty(false);
+      renderTLSSettings(settings, { syncForm: true });
+      showToast(
+        tlsSuccessMessage(body.mode, settings.certificate),
+        "success",
+        body.mode === "self_signed" ? 8000 : 5200,
+      );
+      return true;
+    } catch (error) {
+      if (!isCurrentSettingsRequest(requestEpoch, requestSequence)) return false;
+      if (error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
+      hintError(elements.tlsFormError, errorMessage(error));
+      showToast(`证书保存失败：${errorMessage(error)}`, "error", 7000);
+      return false;
+    } finally {
+      if (isCurrentSettingsRequest(requestEpoch, requestSequence)) {
+        state.settingsSaving = false;
+        updateTLSControls();
+      }
+    }
+  }
+
+  async function reloadTLSCertificate() {
+    if (
+      !state.settings ||
+      !state.settings.available ||
+      (state.settings.mode !== "files" && state.settings.mode !== "default") ||
+      state.settingsSaving ||
+      state.settingsReloading
+    ) {
+      return false;
+    }
+    hintError(elements.tlsFormError, "");
+    state.settingsReloading = true;
+    invalidateSettingsRequests();
+    const requestEpoch = state.settingsRequestEpoch;
+    const requestSequence = ++state.settingsRequestSequence;
+    updateTLSControls();
+    try {
+      const payload = await api("/api/settings/tls/reload", {
+        method: "POST",
+        authRedirect: false,
+        body: {},
+      });
+      if (!isCurrentSettingsRequest(requestEpoch, requestSequence)) return false;
+      const settings = normalizedTLSSettings(payload);
+      state.settingsReloading = false;
+      state.settingsLoaded = true;
+      renderTLSSettings(settings, { syncForm: !state.settingsDirty });
+      showToast(
+        settings.reload_error
+          ? `证书已载入，但自动重载仍有提示：${settings.reload_error}`
+          : "文件证书已重新载入并生效。",
+        settings.reload_error ? "error" : "success",
+        7000,
+      );
+      return !settings.reload_error;
+    } catch (error) {
+      if (!isCurrentSettingsRequest(requestEpoch, requestSequence)) return false;
+      if (error instanceof ApiError && error.status === 401) {
+        showLogin("登录状态已失效，请重新登录。");
+        return false;
+      }
+      hintError(elements.tlsFormError, errorMessage(error));
+      showToast(`文件证书重新载入失败：${errorMessage(error)}`, "error", 7000);
+      return false;
+    } finally {
+      if (isCurrentSettingsRequest(requestEpoch, requestSequence)) {
+        state.settingsReloading = false;
+        updateTLSControls();
+      }
+    }
+  }
+
+  async function loadTLSFile(input, target, label) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const maximumKiB = target === elements.tlsPrivateKeyPem ? 64 : 512;
+    if (file.size > maximumKiB * 1024) {
+      hintError(elements.tlsFormError, `${label}文件不能超过 ${maximumKiB} KiB。`);
+      input.value = "";
+      return;
+    }
+    const epoch = state.settingsRequestEpoch;
+    const previousValue = target.value;
+    const current = () => state.authenticated &&
+      epoch === state.settingsRequestEpoch &&
+      input.files && input.files[0] === file && target.value === previousValue;
+    try {
+      const text = await file.text();
+      if (!current()) return;
+      target.value = text;
+      setSettingsDirty(true);
+      hintError(elements.tlsFormError, "");
+      showToast(`${label}已载入输入框，尚未保存。`);
+    } catch (error) {
+      if (!current()) return;
+      hintError(elements.tlsFormError, `${label}读取失败：${errorMessage(error)}`);
+      input.value = "";
+    }
+  }
+
   function applyTheme(preference) {
     const valid = ["dark", "light", "system"].includes(preference) ? preference : "dark";
     state.themePreference = valid;
@@ -2217,6 +2829,7 @@
     if (safeRoute === "overview") await loadOverview();
     if (safeRoute === "rules") await loadRules();
     if (safeRoute === "engine") await loadEngine();
+    if (safeRoute === "settings") await loadSettings();
   }
 
   function routeFromHash() {
@@ -2252,6 +2865,7 @@
       await loadRules({ silent: true });
     }
     if (state.route === "engine") await loadEngine({ silent: true });
+    if (state.route === "settings") await loadSettings({ silent: true });
   }
 
   function stopPolling() {
@@ -2270,10 +2884,15 @@
   function showLogin(message = "") {
     state.authenticated = false;
     invalidateEngineRequests();
+    invalidateSettingsRequests();
     state.engineSaving = false;
     state.engineInstallRequesting = false;
     state.engineInstallation = null;
     state.engineInstallRequestError = "";
+    state.settingsSaving = false;
+    state.settingsReloading = false;
+    state.settingsLoaded = false;
+    state.settings = null;
     state.ruleProbeLatest.clear();
     state.ruleProbeResults.clear();
     state.ruleProbePending.clear();
@@ -2284,6 +2903,9 @@
     }
     closeRuleDialog();
     closePasswordDialog();
+    resetTLSForm();
+    hintError(elements.settingsAlert, "");
+    elements.settingsLoading.hidden = true;
     if (elements.confirmDialog.open) finishConfirm(false);
     elements.loginPassword.value = "";
     elements.loginPassword.setAttribute("autocomplete", "current-password");
@@ -2304,6 +2926,12 @@
     state.engineInstallation = null;
     state.engineInstallRequesting = false;
     state.engineInstallRequestError = "";
+    state.settingsLoaded = false;
+    state.settings = null;
+    state.settingsLoading = false;
+    state.settingsSaving = false;
+    state.settingsReloading = false;
+    resetTLSForm();
     elements.engineDirty.hidden = true;
     state.templatesLoaded = false;
     elements.loginView.hidden = true;
@@ -2404,6 +3032,28 @@
     elements.engineRecheck.addEventListener("click", () => loadEngine());
     elements.engineInstall.addEventListener("click", installEngine);
     elements.engineCopyInstall.addEventListener("click", copyEngineInstallCommand);
+    elements.tlsForm.addEventListener("submit", submitTLSSettings);
+    elements.tlsRefresh.addEventListener("click", () => loadSettings());
+    elements.settingsRefresh.addEventListener("click", () => loadSettings());
+    elements.tlsReload.addEventListener("click", reloadTLSCertificate);
+    $$('input[name="tls-mode"]', elements.tlsForm).forEach((input) => {
+      input.addEventListener("change", () => {
+        syncTLSModePanels();
+        setSettingsDirty(true);
+        hintError(elements.tlsFormError, "");
+      });
+    });
+    elements.tlsForm.addEventListener("input", (event) => {
+      if (!event.target.matches("input:not([type='radio']):not([type='file']), textarea")) return;
+      setSettingsDirty(true);
+      hintError(elements.tlsFormError, "");
+    });
+    elements.tlsCertificateFile.addEventListener("change", () => {
+      loadTLSFile(elements.tlsCertificateFile, elements.tlsCertificatePem, "证书");
+    });
+    elements.tlsPrivateKeyFile.addEventListener("change", () => {
+      loadTLSFile(elements.tlsPrivateKeyFile, elements.tlsPrivateKeyPem, "私钥");
+    });
 
     elements.ruleSearch.addEventListener("input", renderRules);
     byId("rules-export").addEventListener("click", exportConfig);

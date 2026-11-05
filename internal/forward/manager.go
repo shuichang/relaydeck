@@ -39,6 +39,11 @@ type Snapshot struct {
 	config.Rule
 	Running                 bool   `json:"running"`
 	Error                   string `json:"error"`
+	ErrorNetwork            string `json:"error_network"`
+	LastError               string `json:"last_error"`
+	LastErrorAt             string `json:"last_error_at"`
+	LastRecoveryAt          string `json:"last_recovery_at"`
+	LastErrorNetwork        string `json:"last_error_network"`
 	ActiveConnections       int64  `json:"active_connections"`
 	BytesIn                 uint64 `json:"bytes_in"`
 	BytesOut                uint64 `json:"bytes_out"`
@@ -94,8 +99,38 @@ type runtime struct {
 	bytesOut          atomic.Uint64
 	udpSessions       atomic.Int64
 
-	errMu     sync.RWMutex
-	lastError string
+	errMu          sync.RWMutex
+	errorSequence  atomic.Uint64
+	tcpRecoverable atomic.Bool
+	udpRecoverable atomic.Bool
+	// A success marks every error sequence up to its observation as covered.
+	// This prevents an older write that loses the lock race from resurfacing
+	// after recovery.
+	tcpRecoveredThrough atomic.Uint64
+	udpRecoveredThrough atomic.Uint64
+	tcpErrors           transportErrorState
+	udpErrors           transportErrorState
+	ruleError           runtimeError
+	errorHistory        errorHistory
+	lastRecoveryAt      time.Time
+}
+
+type runtimeError struct {
+	text     string
+	at       time.Time
+	sequence uint64
+}
+
+type transportErrorState struct {
+	// recoverable is cleared by a transport-specific success event. listener
+	// faults stay visible until their endpoint runtime is replaced.
+	recoverable runtimeError
+	listener    runtimeError
+}
+
+type errorHistory struct {
+	runtimeError
+	network string
 }
 
 // NewManager creates an empty forwarding manager.
@@ -299,6 +334,12 @@ func (m *Manager) Apply(rules []config.Rule) error {
 			return fmt.Errorf("apply rule %q: %w", spec.rule.ID, err)
 		}
 		prepared[spec.key] = rt
+		if old := oldRuntime[spec.key]; old != nil {
+			// A replacement listener starts with no unresolved state. Its
+			// rule-level history remains useful, especially when only a
+			// non-transport option or the target changed.
+			rt.copyErrorHistoryFrom(old)
+		}
 	}
 
 	for _, rt := range prepared {
@@ -345,7 +386,7 @@ func (m *Manager) restoreRuntimesLocked(oldRuntime map[ruleKey]*runtime, stopped
 			}
 			for stoppedKey, stoppedRT := range stopped {
 				if _, recovered := restored[stoppedKey]; !recovered {
-					stoppedRT.setError(fmt.Errorf("listener rollback failed: %v", err))
+					stoppedRT.setLifecycleError(fmt.Errorf("listener rollback failed: %v", err))
 					partial[stoppedKey] = stoppedRT
 				}
 			}
@@ -470,11 +511,39 @@ func (rt *runtime) fillSnapshot(snapshot *Snapshot) {
 	snapshot.BytesOut = rt.bytesOut.Load()
 	snapshot.UDPSessions = rt.udpSessions.Load()
 	rt.errMu.RLock()
-	snapshot.Error = rt.lastError
+	snapshot.Error, snapshot.ErrorNetwork = rt.latestUnresolvedErrorLocked()
+	snapshot.LastError = rt.errorHistory.text
+	snapshot.LastErrorAt = formatErrorTime(rt.errorHistory.at)
+	snapshot.LastRecoveryAt = formatErrorTime(rt.lastRecoveryAt)
+	snapshot.LastErrorNetwork = rt.errorHistory.network
 	rt.errMu.RUnlock()
 }
 
-func (rt *runtime) setError(err error) {
+func (rt *runtime) setTCPError(err error) {
+	rt.setTransportError("tcp", false, err)
+}
+
+func (rt *runtime) setTCPListenerError(err error) {
+	rt.setTransportError("tcp", true, err)
+}
+
+func (rt *runtime) setUDPError(err error) {
+	rt.setTransportError("udp", false, err)
+}
+
+func (rt *runtime) setUDPListenerError(err error) {
+	rt.setTransportError("udp", true, err)
+}
+
+func (rt *runtime) setLifecycleError(err error) {
+	rt.setError("", false, err)
+}
+
+func (rt *runtime) setTransportError(network string, listener bool, err error) {
+	rt.setError(network, listener, err)
+}
+
+func (rt *runtime) setError(network string, listener bool, err error) {
 	if err == nil {
 		return
 	}
@@ -482,8 +551,145 @@ func (rt *runtime) setError(err error) {
 	if len(text) > maxRuntimeErrorBytes {
 		text = text[:maxRuntimeErrorBytes]
 	}
+	record := runtimeError{
+		text:     text,
+		at:       time.Now().UTC(),
+		sequence: rt.errorSequence.Add(1),
+	}
+
 	rt.errMu.Lock()
-	rt.lastError = text
+	switch network {
+	case "tcp":
+		if listener {
+			if record.sequence > rt.tcpErrors.listener.sequence {
+				rt.tcpErrors.listener = record
+			}
+		} else if record.sequence > rt.tcpRecoveredThrough.Load() {
+			if record.sequence > rt.tcpErrors.recoverable.sequence {
+				rt.tcpErrors.recoverable = record
+			}
+			rt.tcpRecoverable.Store(true)
+		}
+	case "udp":
+		if listener {
+			if record.sequence > rt.udpErrors.listener.sequence {
+				rt.udpErrors.listener = record
+			}
+		} else if record.sequence > rt.udpRecoveredThrough.Load() {
+			if record.sequence > rt.udpErrors.recoverable.sequence {
+				rt.udpErrors.recoverable = record
+			}
+			rt.udpRecoverable.Store(true)
+		}
+	default:
+		if record.sequence > rt.ruleError.sequence {
+			rt.ruleError = record
+		}
+	}
+	if record.sequence > rt.errorHistory.sequence {
+		rt.errorHistory = errorHistory{runtimeError: record, network: network}
+	}
+	rt.errMu.Unlock()
+}
+
+// tcpUpstreamEstablished records a successful upstream handshake. The
+// sequence is captured first so a failure written after this event cannot be
+// erased by a slower recovery attempt.
+func (rt *runtime) tcpUpstreamEstablished() {
+	through := rt.errorSequence.Load()
+	advanceSequence(&rt.tcpRecoveredThrough, through)
+	if !rt.tcpRecoverable.Load() {
+		return
+	}
+	rt.clearRecoverableError("tcp", through)
+}
+
+// udpTargetReplied is called only after a real datagram has been received
+// from the configured UDP target. A successful DialUDP or Write does not prove
+// that the target is reachable.
+func (rt *runtime) udpTargetReplied() {
+	through := rt.errorSequence.Load()
+	advanceSequence(&rt.udpRecoveredThrough, through)
+	if !rt.udpRecoverable.Load() {
+		return
+	}
+	rt.clearRecoverableError("udp", through)
+}
+
+func advanceSequence(target *atomic.Uint64, value uint64) {
+	for {
+		current := target.Load()
+		if value <= current || target.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func (rt *runtime) clearRecoverableError(network string, through uint64) {
+	rt.errMu.Lock()
+	defer rt.errMu.Unlock()
+
+	var state *transportErrorState
+	var active *atomic.Bool
+	switch network {
+	case "tcp":
+		state = &rt.tcpErrors
+		active = &rt.tcpRecoverable
+	case "udp":
+		state = &rt.udpErrors
+		active = &rt.udpRecoverable
+	default:
+		return
+	}
+	if state.recoverable.sequence == 0 || state.recoverable.sequence > through {
+		return
+	}
+	state.recoverable = runtimeError{}
+	active.Store(false)
+	rt.lastRecoveryAt = time.Now().UTC()
+}
+
+func (rt *runtime) latestUnresolvedErrorLocked() (string, string) {
+	var latest runtimeError
+	network := ""
+	consider := func(candidate runtimeError, candidateNetwork string) {
+		if candidate.sequence > latest.sequence {
+			latest = candidate
+			network = candidateNetwork
+		}
+	}
+	consider(rt.tcpErrors.recoverable, "tcp")
+	consider(rt.tcpErrors.listener, "tcp")
+	consider(rt.udpErrors.recoverable, "udp")
+	consider(rt.udpErrors.listener, "udp")
+	consider(rt.ruleError, "")
+	return latest.text, network
+}
+
+func formatErrorTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func (rt *runtime) copyErrorHistoryFrom(old *runtime) {
+	old.errMu.RLock()
+	history := old.errorHistory
+	recovery := old.lastRecoveryAt
+	sequence := old.errorSequence.Load()
+	old.errMu.RUnlock()
+
+	rt.errMu.Lock()
+	if history.sequence > rt.errorHistory.sequence {
+		rt.errorHistory = history
+	}
+	if recovery.After(rt.lastRecoveryAt) {
+		rt.lastRecoveryAt = recovery
+	}
+	if sequence > rt.errorSequence.Load() {
+		rt.errorSequence.Store(sequence)
+	}
 	rt.errMu.Unlock()
 }
 
@@ -491,7 +697,18 @@ func (rt *runtime) copyStatsFrom(old *runtime) {
 	rt.bytesIn.Store(old.bytesIn.Load())
 	rt.bytesOut.Store(old.bytesOut.Load())
 	old.errMu.RLock()
-	rt.lastError = old.lastError
+	rt.errMu.Lock()
+	rt.tcpErrors = old.tcpErrors
+	rt.udpErrors = old.udpErrors
+	rt.ruleError = old.ruleError
+	rt.errorHistory = old.errorHistory
+	rt.lastRecoveryAt = old.lastRecoveryAt
+	rt.errorSequence.Store(old.errorSequence.Load())
+	rt.tcpRecoverable.Store(old.tcpErrors.recoverable.sequence != 0)
+	rt.udpRecoverable.Store(old.udpErrors.recoverable.sequence != 0)
+	rt.tcpRecoveredThrough.Store(old.tcpRecoveredThrough.Load())
+	rt.udpRecoveredThrough.Store(old.udpRecoveredThrough.Load())
+	rt.errMu.Unlock()
 	old.errMu.RUnlock()
 }
 

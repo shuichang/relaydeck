@@ -38,7 +38,9 @@ jobs:
           node-version: "24"
 
       - name: Check browser test script
-        run: node --check scripts/test-web.cjs
+        run: |
+          node --check scripts/test-web.cjs
+          node --check scripts/test-tls.cjs
 
       - name: Install browser test dependencies
         run: |
@@ -70,6 +72,11 @@ jobs:
 
       - name: Build browser test binary
         run: go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/relaydeck-ui" ./cmd/relaydeck
+
+      - name: TLS rotation regression
+        env:
+          RELAYDECK_BINARY: ${{ runner.temp }}/relaydeck-ui
+        run: node scripts/test-tls.cjs
 
       - name: Browser UI regression
         env:

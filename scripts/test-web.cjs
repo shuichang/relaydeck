@@ -153,10 +153,109 @@ function installationPayload(overrides = {}) {
   };
 }
 
+function tlsCertificatePayload(overrides = {}) {
+  return {
+    subject: 'CN=relay.example.com',
+    issuer: 'CN=Fixture CA, O=RelayDeck QA',
+    dns_names: ['relay.example.com'],
+    ip_addresses: ['203.0.113.10'],
+    not_before: '2026-01-01T00:00:00Z',
+    not_after: '2027-01-01T00:00:00Z',
+    fingerprint_sha256: 'AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99',
+    self_signed: false,
+    valid_now: true,
+    ...overrides,
+  };
+}
+
+function tlsSettingsPayload(overrides = {}) {
+  return {
+    available: true,
+    mode: 'files',
+    certificate: tlsCertificatePayload(),
+    cert_path: '/etc/letsencrypt/live/relay.example.com/fullchain.pem',
+    key_path: '/etc/letsencrypt/live/relay.example.com/privkey.pem',
+    auto_reload_seconds: 60,
+    reload_error: '',
+    updated_at: '2026-11-05T08:00:00Z',
+    message: '',
+    ...overrides,
+  };
+}
+
+async function computedFontSize(locator) {
+  return await locator.evaluate(node => getComputedStyle(node).fontSize);
+}
+
+async function overflowDiagnostics(page) {
+  return await page.evaluate(() => {
+    const viewportWidth = window.innerWidth;
+    const allElements = [...document.querySelectorAll('body *')];
+    const overflow = allElements
+      .map(node => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return {
+          tag: node.tagName,
+          id: node.id,
+          className: typeof node.className === 'string' ? node.className : '',
+          text: (node.textContent || '').trim().slice(0, 80),
+          left: Math.round(rect.left * 10) / 10,
+          right: Math.round(rect.right * 10) / 10,
+          documentRight: Math.round((rect.right + window.scrollX) * 10) / 10,
+          width: Math.round(rect.width * 10) / 10,
+          position: style.position,
+          display: style.display,
+        };
+      })
+      .filter(entry => entry.display !== 'none' && entry.documentRight > viewportWidth + 0.5)
+      .sort((left, right) => right.documentRight - left.documentRight)
+      .slice(0, 30);
+    const wideBoxes = allElements
+      .map(node => {
+        const rect = node.getBoundingClientRect();
+        return {
+          tag: node.tagName,
+          id: node.id,
+          className: typeof node.className === 'string' ? node.className : '',
+          width: Math.round(rect.width * 10) / 10,
+          left: Math.round(rect.left * 10) / 10,
+          right: Math.round(rect.right * 10) / 10,
+          scrollWidth: node.scrollWidth,
+          clientWidth: node.clientWidth,
+        };
+      })
+      .filter(entry => entry.width > viewportWidth + 0.5 || entry.scrollWidth > viewportWidth + 0.5)
+      .sort((left, right) => Math.max(right.width, right.scrollWidth) - Math.max(left.width, left.scrollWidth))
+      .slice(0, 30);
+    return {
+      innerWidth: viewportWidth,
+      outerWidth: window.outerWidth,
+      scrollX: window.scrollX,
+      activeElement: document.activeElement
+        ? `${document.activeElement.tagName}#${document.activeElement.id}.${document.activeElement.className}`
+        : '',
+      documentScrollWidth: document.documentElement.scrollWidth,
+      bodyScrollWidth: document.body.scrollWidth,
+      overflow,
+      wideBoxes,
+    };
+  });
+}
+
 async function settleFrames(page) {
   await page.evaluate(() => new Promise(resolve => {
     requestAnimationFrame(() => requestAnimationFrame(resolve));
   }));
+}
+
+async function capturePage(page, name) {
+  await page.locator('#toast-region button').evaluateAll(buttons => {
+    buttons.forEach(button => button.click());
+  });
+  await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: 'instant' }));
+  await settleFrames(page);
+  await page.screenshot({ path: artifactPath(name), fullPage: true, animations: 'disabled' });
 }
 
 async function checkEngineEnabled(page) {
@@ -266,7 +365,10 @@ async function run() {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1050 } });
   page.setDefaultTimeout(12000);
   const errors = [];
+  const consoleMessages = [];
+  const privateKeyMarker = 'QA-PRIVATE-KEY-MUST-NEVER-PERSIST';
   page.on('pageerror', error => errors.push(error.message));
+  page.on('console', message => consoleMessages.push(message.text()));
 
   await page.goto(origin, { waitUntil: 'networkidle' });
   await page.locator('#login-username').fill(username);
@@ -274,6 +376,304 @@ async function run() {
   await page.locator('#login-submit').click();
   await page.locator('#app-view').waitFor({ state: 'visible' });
   await page.waitForFunction(() => document.getElementById('browser-panel-rtt-value').textContent.includes('ms'));
+
+  let controlledTLS = tlsSettingsPayload({
+    available: false,
+    mode: 'default',
+    certificate: null,
+    cert_path: '',
+    key_path: '',
+    auto_reload_seconds: 0,
+    message: '本地 HTTP 预览不支持在线管理 TLS 证书。',
+  });
+  let nextTLSGet;
+  let nextTLSPut;
+  let nextTLSReload;
+  const fulfillTLS = (route, payload, status = 200) => route.fulfill({
+    status,
+    contentType: 'application/json',
+    body: JSON.stringify(payload),
+  });
+  await page.route('**/api/settings/tls', async route => {
+    const request = route.request();
+    if (request.method() === 'GET') {
+      if (nextTLSGet) {
+        const handler = nextTLSGet;
+        nextTLSGet = undefined;
+        await handler(route);
+        return;
+      }
+      await fulfillTLS(route, controlledTLS);
+      return;
+    }
+    if (request.method() === 'PUT') {
+      const body = request.postDataJSON();
+      if (nextTLSPut) {
+        const handler = nextTLSPut;
+        nextTLSPut = undefined;
+        await handler(route, body);
+        return;
+      }
+      controlledTLS = tlsSettingsPayload({ mode: body.mode });
+      await fulfillTLS(route, controlledTLS);
+      return;
+    }
+    await route.continue();
+  });
+  await page.route('**/api/settings/tls/reload', async route => {
+    if (route.request().method() !== 'POST') return route.continue();
+    if (nextTLSReload) {
+      const handler = nextTLSReload;
+      nextTLSReload = undefined;
+      await handler(route, route.request().postDataJSON());
+      return;
+    }
+    await fulfillTLS(route, controlledTLS);
+  });
+
+  nextTLSGet = async route => {
+    await fulfillTLS(route, { error: 'fixture settings session expired' }, 401);
+  };
+  await page.locator('[data-route="settings"]').click();
+  await page.locator('#login-view').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#login-error').textContent(), /登录状态已失效/);
+  report.settingsUnauthorizedExits = 'passed';
+
+  await page.locator('#login-username').fill(username);
+  await page.locator('#login-password').fill(password);
+  await page.locator('#login-submit').click();
+  await page.locator('#app-view').waitFor({ state: 'visible' });
+  await page.locator('#settings-unavailable').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#settings-main').isVisible(), false);
+  assert.match(await page.locator('#settings-unavailable-message').textContent(), /本地 HTTP 预览/);
+  report.settingsUnavailable = 'passed';
+
+  controlledTLS = tlsSettingsPayload();
+  await page.locator('#settings-refresh').click();
+  await page.locator('#settings-main').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#tls-subject').textContent(), /CN=relay\.example\.com/);
+  assert.match(await page.locator('#tls-issuer').textContent(), /Fixture CA/);
+  assert.equal(await page.locator('#tls-validity-badge').textContent(), '有效');
+  assert.match(await page.locator('#tls-dns-sans').textContent(), /relay\.example\.com/);
+  assert.match(await page.locator('#tls-ip-sans').textContent(), /203\.0\.113\.10/);
+  assert.match(await page.locator('#tls-auto-reload').textContent(), /每 60 秒/);
+  assert.match(await page.locator('#tls-cert-path').inputValue(), /fullchain\.pem/);
+  assert.match(await page.locator('.tls-browser-note').textContent(), /SAN 匹配的域名或 IP/);
+  assert.equal(await computedFontSize(page.locator('.tls-summary dd').first()), '14px');
+  report.settingsCertificateDetails = 'passed';
+
+  await page.locator('#tls-cert-path').fill('/srv/draft/fullchain.pem');
+  await page.locator('#tls-draft-badge').waitFor({ state: 'visible' });
+  nextTLSGet = async route => {
+    await fulfillTLS(route, { error: 'fixture settings read failure' }, 503);
+  };
+  await page.locator('#settings-refresh').click();
+  await page.waitForFunction(() => !document.getElementById('settings-alert').hidden);
+  assert.match(await page.locator('#settings-alert').textContent(), /fixture settings read failure/);
+  assert.equal(await page.locator('#tls-cert-path').inputValue(), '/srv/draft/fullchain.pem');
+
+  controlledTLS = tlsSettingsPayload({
+    certificate: tlsCertificatePayload({ subject: 'CN=refreshed.example.com' }),
+  });
+  await page.locator('#settings-refresh').click();
+  await page.waitForFunction(() => document.getElementById('tls-subject').textContent.includes('refreshed.example.com'));
+  assert.equal(await page.locator('#tls-cert-path').inputValue(), '/srv/draft/fullchain.pem');
+  report.settingsDraftSurvivesLoadFailureAndRefresh = 'passed';
+
+  await page.getByText('粘贴 PEM', { exact: true }).click();
+  await page.locator('#tls-certificate-pem').fill('-----BEGIN CERTIFICATE-----\nQA-CERT\n-----END CERTIFICATE-----');
+  await page.locator('#tls-private-key-pem').fill(`-----BEGIN PRIVATE KEY-----\n${privateKeyMarker}\n-----END PRIVATE KEY-----`);
+  let failedPemBody;
+  nextTLSPut = async (route, body) => {
+    failedPemBody = body;
+    await fulfillTLS(route, { error: 'invalid certificate fixture' }, 400);
+  };
+  await page.locator('#tls-save').click();
+  await page.locator('#tls-form-error').waitFor({ state: 'visible' });
+  assert.match(await page.locator('#tls-form-error').textContent(), /invalid certificate fixture/);
+  assert.equal(failedPemBody.mode, 'pem');
+  assert.match(await page.locator('#tls-private-key-pem').inputValue(), new RegExp(privateKeyMarker));
+
+  const uploadedCertificate = '-----BEGIN CERTIFICATE-----\nUPLOADED-CERT\n-----END CERTIFICATE-----\n';
+  const uploadedPrivateKey = `-----BEGIN PRIVATE KEY-----\n${privateKeyMarker}-UPLOADED\n-----END PRIVATE KEY-----\n`;
+  await page.locator('#tls-certificate-file').setInputFiles({
+    name: 'certificate.pem',
+    mimeType: 'text/plain',
+    buffer: Buffer.from(uploadedCertificate),
+  });
+  await page.locator('#tls-private-key-file').setInputFiles({
+    name: 'private-key.pem',
+    mimeType: 'text/plain',
+    buffer: Buffer.from(uploadedPrivateKey),
+  });
+  await page.waitForFunction(
+    markers => document.getElementById('tls-certificate-pem').value.includes(markers.cert)
+      && document.getElementById('tls-private-key-pem').value.includes(markers.key),
+    { cert: 'UPLOADED-CERT', key: `${privateKeyMarker}-UPLOADED` },
+  );
+
+  let successfulPemBody;
+  nextTLSPut = async (route, body) => {
+    successfulPemBody = body;
+    controlledTLS = tlsSettingsPayload({
+      mode: 'pem',
+      certificate: tlsCertificatePayload({ subject: 'CN=pem.example.com', issuer: 'CN=QA Issuer' }),
+      cert_path: '',
+      key_path: '',
+      auto_reload_seconds: 0,
+    });
+    await fulfillTLS(route, controlledTLS);
+  };
+  await page.locator('#tls-save').click();
+  await page.waitForFunction(() => document.getElementById('tls-subject').textContent.includes('pem.example.com'));
+  assert.equal(successfulPemBody.mode, 'pem');
+  assert.equal(successfulPemBody.certificate_pem, uploadedCertificate);
+  assert.equal(successfulPemBody.private_key_pem, uploadedPrivateKey);
+  assert.equal(await page.locator('#tls-certificate-pem').inputValue(), '');
+  assert.equal(await page.locator('#tls-private-key-pem').inputValue(), '');
+  assert.equal(await page.locator('#tls-certificate-file').evaluate(node => node.files.length), 0);
+  assert.equal(await page.locator('#tls-private-key-file').evaluate(node => node.files.length), 0);
+  assert.equal(await page.locator('#tls-reload').isDisabled(), true);
+  const browserStorage = await page.evaluate(() => Object.values(localStorage).join('\n'));
+  assert.doesNotMatch(browserStorage, new RegExp(privateKeyMarker));
+  assert.doesNotMatch(await page.locator('body').textContent(), new RegExp(privateKeyMarker));
+  report.settingsPemFailureRetainsDraftAndSuccessClearsSecrets = 'passed';
+
+  await page.getByText('自签证书', { exact: true }).click();
+  await page.locator('#tls-self-signed-hosts').fill('relay.example.com\n203.0.113.10\n::1');
+  await page.locator('#tls-self-signed-days').fill('90');
+  let selfSignedBody;
+  nextTLSPut = async (route, body) => {
+    selfSignedBody = body;
+    controlledTLS = tlsSettingsPayload({
+      mode: 'self_signed',
+      certificate: tlsCertificatePayload({
+        subject: 'CN=relay.example.com',
+        issuer: 'CN=relay.example.com',
+        dns_names: ['relay.example.com'],
+        ip_addresses: ['203.0.113.10', '::1'],
+        self_signed: true,
+      }),
+      cert_path: '/var/lib/relaydeck/tls/fullchain.pem',
+      key_path: '/var/lib/relaydeck/tls/privkey.pem',
+      auto_reload_seconds: 0,
+    });
+    await fulfillTLS(route, controlledTLS);
+  };
+  await page.locator('#tls-save').click();
+  await page.waitForFunction(() => document.getElementById('tls-mode-badge').textContent === '自签证书');
+  assert.deepEqual(selfSignedBody, {
+    mode: 'self_signed',
+    hosts: ['relay.example.com', '203.0.113.10', '::1'],
+    days: 90,
+  });
+  report.settingsSelfSigned = 'passed';
+
+  await page.getByText('服务器文件', { exact: true }).click();
+  await page.locator('#tls-cert-path').fill('/etc/letsencrypt/live/relay.example.com/fullchain.pem');
+  await page.locator('#tls-key-path-input').fill('/etc/letsencrypt/live/relay.example.com/privkey.pem');
+  let filesBody;
+  nextTLSPut = async (route, body) => {
+    filesBody = body;
+    controlledTLS = tlsSettingsPayload();
+    await fulfillTLS(route, controlledTLS);
+  };
+  await page.locator('#tls-save').click();
+  await page.waitForFunction(() => document.getElementById('tls-auto-reload').textContent.includes('60 秒'));
+  assert.deepEqual(filesBody, {
+    mode: 'files',
+    cert_path: '/etc/letsencrypt/live/relay.example.com/fullchain.pem',
+    key_path: '/etc/letsencrypt/live/relay.example.com/privkey.pem',
+  });
+  assert.equal(await page.locator('#tls-reload').isDisabled(), false);
+  await page.locator('#tls-key-path-input').fill('/srv/pending/private.key');
+  let reloadBody;
+  nextTLSReload = async (route, body) => {
+    reloadBody = body;
+    controlledTLS = tlsSettingsPayload({ updated_at: '2026-11-05T09:00:00Z' });
+    await fulfillTLS(route, controlledTLS);
+  };
+  await page.locator('#tls-reload').click();
+  await page.waitForFunction(() => document.querySelector('#toast-region').textContent.includes('文件证书已重新载入'));
+  assert.deepEqual(reloadBody, {});
+  assert.equal(await page.locator('#tls-key-path-input').inputValue(), '/srv/pending/private.key');
+  assert.equal(await page.locator('#tls-draft-badge').isVisible(), true);
+  report.settingsFilesReload = 'passed';
+
+  await capturePage(page, 'settings-desktop.png');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await delay(300);
+  const settingsMobileOverflow = await overflowDiagnostics(page);
+  assert.equal(
+    settingsMobileOverflow.documentScrollWidth > settingsMobileOverflow.innerWidth,
+    false,
+    JSON.stringify(settingsMobileOverflow),
+  );
+  await capturePage(page, 'settings-mobile.png');
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  await delay(300);
+  report.settingsMobileOverflow = false;
+
+  await page.getByText('启动默认', { exact: true }).click();
+  let defaultBody;
+  nextTLSPut = async (route, body) => {
+    defaultBody = body;
+    controlledTLS = tlsSettingsPayload({ mode: 'default', certificate: null, cert_path: '', key_path: '', auto_reload_seconds: 60 });
+    await fulfillTLS(route, controlledTLS);
+  };
+  await page.locator('#tls-save').click();
+  await page.waitForFunction(() => document.getElementById('tls-mode-badge').textContent === '启动默认');
+  assert.deepEqual(defaultBody, { mode: 'default' });
+
+  await page.getByText('粘贴 PEM', { exact: true }).click();
+  await page.locator('#tls-private-key-pem').fill(`-----BEGIN PRIVATE KEY-----\n${privateKeyMarker}-LOGOUT\n-----END PRIVATE KEY-----`);
+  await page.locator('#tls-private-key-file').setInputFiles({
+    name: 'logout-key.pem',
+    mimeType: 'text/plain',
+    buffer: Buffer.from(`-----BEGIN PRIVATE KEY-----\n${privateKeyMarker}-FILE\n-----END PRIVATE KEY-----\n`),
+  });
+  await page.waitForFunction(
+    marker => document.getElementById('tls-private-key-pem').value.includes(marker),
+    `${privateKeyMarker}-FILE`,
+  );
+  await page.evaluate(marker => {
+    const original = File.prototype.text;
+    File.prototype.text = function () {
+      if (this.name === 'delayed-logout-key.pem') {
+        return new Promise(resolve => { window.releaseDelayedTLSFile = () => resolve(marker); });
+      }
+      return original.call(this);
+    };
+    window.restoreTLSFileReader = () => { File.prototype.text = original; };
+  }, `${privateKeyMarker}-DELAYED-OLD-SESSION`);
+  await page.locator('#tls-private-key-file').setInputFiles({
+    name: 'delayed-logout-key.pem', mimeType: 'text/plain', buffer: Buffer.from('deferred private key'),
+  });
+  await page.waitForFunction(() => typeof window.releaseDelayedTLSFile === 'function');
+  await page.locator('#logout-button').click();
+  await page.locator('#login-view').waitFor({ state: 'visible' });
+  assert.equal(await page.locator('#tls-private-key-pem').inputValue(), '');
+  assert.equal(await page.locator('#tls-private-key-file').evaluate(node => node.files.length), 0);
+  report.settingsLogoutClearsSecrets = 'passed';
+
+  await page.locator('#login-username').fill(username);
+  await page.locator('#login-password').fill(password);
+  await page.locator('#login-submit').click();
+  await page.locator('#app-view').waitFor({ state: 'visible' });
+  await page.locator('#settings-main').waitFor({ state: 'visible' });
+  await page.evaluate(() => {
+    window.releaseDelayedTLSFile();
+    window.restoreTLSFileReader();
+    delete window.releaseDelayedTLSFile;
+    delete window.restoreTLSFileReader;
+  });
+  await settleFrames(page);
+  assert.equal(await page.locator('#tls-private-key-pem').inputValue(), '');
+  assert.equal(await page.locator('#tls-private-key-file').evaluate(node => node.files.length), 0);
+  report.settingsLateFileReadCannotRestoreLoggedOutSecrets = 'passed';
+  await page.locator('[data-route="rules"]').click();
+  await page.unroute('**/api/settings/tls/reload');
+  await page.unroute('**/api/settings/tls');
 
   assert.equal((await pageAPI(page, 'PUT', '/api/rules', { rules: [] })).status, 200);
   await page.reload({ waitUntil: 'networkidle' });
@@ -337,6 +737,40 @@ async function run() {
   assert.equal(saved.length, 1);
   assert.equal(saved[0].max_connections, 8192);
   assert.equal(saved[0].effective_max_connections, 8192);
+  const ruleTypography = await page.evaluate(() => {
+    const size = selector => getComputedStyle(document.querySelector(selector)).fontSize;
+    return {
+      body: getComputedStyle(document.body).fontSize,
+      nav: size('.nav-item'),
+      button: size('.button'),
+      header: size('.rules-table th'),
+      cell: size('.rules-table td'),
+      name: size('.rule-name strong'),
+      endpoint: size('.endpoint'),
+      limit: size('.limit-list'),
+      runtime: size('.runtime-state'),
+      probe: size('.rule-probe-heading'),
+    };
+  });
+  assert.ok(Number.parseFloat(ruleTypography.body) >= 15);
+  assert.ok(Number.parseFloat(ruleTypography.nav) >= 14);
+  assert.ok(Number.parseFloat(ruleTypography.button) >= 14);
+  assert.ok(Number.parseFloat(ruleTypography.header) >= 12);
+  assert.ok(Number.parseFloat(ruleTypography.cell) >= 14);
+  assert.ok(Number.parseFloat(ruleTypography.name) >= 16);
+  assert.ok(Number.parseFloat(ruleTypography.endpoint) >= 14);
+  assert.ok(Number.parseFloat(ruleTypography.limit) >= 12);
+  assert.ok(Number.parseFloat(ruleTypography.runtime) >= 12);
+  assert.ok(Number.parseFloat(ruleTypography.probe) >= 12);
+  assert.equal(await page.evaluate(() => {
+    const cell = document.querySelector('#rules-body tr td:last-child');
+    const buttons = [...cell.querySelectorAll('button')].map(node => node.getBoundingClientRect());
+    const bounds = cell.getBoundingClientRect();
+    return buttons.length === 3
+      && buttons.every(box => box.left >= bounds.left && box.right <= bounds.right + 0.5)
+      && buttons.every((box, index) => index === 0 || box.left >= buttons[index - 1].right - 0.5);
+  }), true);
+  report.ruleTypography = 'passed';
 
   // Deterministically reorder requests from the list and edit dialog, which
   // share a cache. Cover both late success and late HTTP failure paths.
@@ -424,13 +858,100 @@ async function run() {
   await page.locator('#rules-refresh').click();
   await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('TCP 连接'));
 
-  await page.screenshot({ path: artifactPath('rules-desktop.png'), fullPage: true });
+  let ruleHistoryPayload = [{
+    ...saved[0],
+    running: true,
+    error: '',
+    error_network: '',
+    last_error: 'TCP upstream reset fixture',
+    last_error_at: '2026-11-05T01:00:00Z',
+    last_recovery_at: '2026-11-05T01:01:00Z',
+    last_error_network: 'tcp',
+  }];
+  await page.route('**/api/rules', async route => {
+    if (route.request().method() !== 'GET') return route.continue();
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(ruleHistoryPayload),
+    });
+  });
+  await page.locator('#rules-refresh').click();
+  await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('最近错误（TCP）'));
+  assert.match(await page.locator('#rules-body .runtime-state').textContent(), /^运行中$/);
+  assert.doesNotMatch(await page.locator('#rules-body .runtime').textContent(), /当前错误/);
+  assert.doesNotMatch(await page.locator('#rules-body .runtime-state').getAttribute('class'), /bad|has-error/);
+  assert.match(await page.locator('#rules-body .rule-history').textContent(), /已恢复/);
+  report.ruleRecoveredHistory = 'passed';
+
+  ruleHistoryPayload = [{
+    ...saved[0],
+    running: true,
+    error: 'UDP target reply timeout fixture',
+    error_network: 'udp',
+    last_error: 'older TCP reset fixture',
+    last_error_at: '2026-11-05T01:00:00Z',
+    last_recovery_at: '2026-11-05T01:01:00Z',
+    last_error_network: 'tcp',
+  }];
+  await page.locator('#rules-refresh').click();
+  await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('当前错误（UDP）'));
+  assert.match(await page.locator('#rules-body .runtime-state').textContent(), /^运行中 · 当前错误$/);
+  assert.doesNotMatch(await page.locator('#rules-body .runtime-state').textContent(), /启动异常|已停用/);
+  assert.match(await page.locator('#rules-body .rule-current-error').textContent(), /UDP[\s\S]*reply timeout/);
+  report.ruleCurrentAndHistoryNetworksSeparated = 'passed';
+
+  ruleHistoryPayload = [{
+    ...saved[0],
+    listen: '[2001:db8:1234:5678:90ab:cdef:1234:5678]:443',
+    running: true,
+    error: '',
+    error_network: '',
+    last_error: 'Target reset after address replacement; historical detail remains intentionally long to verify wrapping.',
+    last_error_at: '2026-11-05T03:00:00Z',
+    last_recovery_at: '2026-11-05T02:00:00Z',
+    last_error_network: 'tcp',
+  }];
+  await page.locator('#rules-refresh').click();
+  await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('历史记录，当前目标需重新检测'));
+  assert.doesNotMatch(await page.locator('#rules-body .rule-history').textContent(), /已恢复/);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  report.ruleStaleRecoveryNotClaimed = 'passed';
+
+  ruleHistoryPayload = [{
+    ...saved[0],
+    running: true,
+    error: '',
+    error_network: '',
+    last_error: 'UDP reply timeout fixture',
+    last_error_at: '2026-11-05T04:00:00Z',
+    last_recovery_at: '',
+    last_error_network: 'udp',
+  }];
+  await page.locator('#rules-refresh').click();
+  await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('UDP 恢复尚待真实回包确认'));
+  assert.doesNotMatch(await page.locator('#rules-body .rule-history').textContent(), /已恢复/);
+  report.ruleUdpRecoveryNotInvented = 'passed';
+  await page.unroute('**/api/rules');
+  await page.locator('#rules-refresh').click();
+  await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('TCP 连接'));
+
+  await capturePage(page, 'rules-desktop.png');
   await page.setViewportSize({ width: 390, height: 844 });
   await delay(300);
-  await page.screenshot({ path: artifactPath('rules-mobile.png'), fullPage: true });
+  await capturePage(page, 'rules-mobile.png');
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  assert.ok(Number.parseFloat(await computedFontSize(page.locator('#rules-body .rule-name strong').first())) >= 16);
+  assert.ok(Number.parseFloat(await computedFontSize(page.locator('#rules-body .endpoint').first())) >= 14);
+  assert.equal(await page.evaluate(() => {
+    const row = document.querySelector('#rules-body tr');
+    const buttons = [...row.querySelectorAll('.row-actions button')].map(node => node.getBoundingClientRect());
+    const bounds = row.getBoundingClientRect();
+    return buttons.every(box => box.left >= bounds.left && box.right <= bounds.right + 0.5)
+      && buttons.every((box, index) => index === 0 || box.left >= buttons[index - 1].right - 0.5);
+  }), true);
   await page.locator('[data-action="new-rule"]:visible').first().click();
-  await page.screenshot({ path: artifactPath('draft-mobile.png'), fullPage: true });
+  await capturePage(page, 'draft-mobile.png');
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   await page.locator('#rule-cancel-x').click();
   report.mobileOverflow = false;
@@ -562,11 +1083,11 @@ async function run() {
   await page.setViewportSize({ width: 390, height: 844 });
   await delay(300);
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
-  await page.screenshot({ path: artifactPath('engine-install-mobile.png'), fullPage: true, animations: 'disabled' });
+  await capturePage(page, 'engine-install-mobile.png');
   report.engineMobileOverflow = false;
   await page.setViewportSize({ width: 1440, height: 1050 });
   await delay(300);
-  await page.screenshot({ path: artifactPath('engine-install-desktop.png'), fullPage: true, animations: 'disabled' });
+  await capturePage(page, 'engine-install-desktop.png');
   const installButton = page.getByRole('button', { name: /安装|重试/ }).first();
   await installButton.waitFor({ state: 'visible' });
 
@@ -802,6 +1323,8 @@ async function run() {
 
   assert.deepEqual(errors, []);
   report.browserErrors = errors;
+  assert.equal(consoleMessages.some(message => message.includes(privateKeyMarker)), false);
+  report.privateKeyConsoleLeak = false;
   assert.equal((await pageAPI(page, 'PUT', '/api/rules', { rules: [] })).status, 200);
   await writeReport();
   console.log(JSON.stringify(report, null, 2));

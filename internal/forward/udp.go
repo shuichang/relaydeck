@@ -144,14 +144,15 @@ func (e *udpEndpoint) run() {
 			if errors.Is(err, net.ErrClosed) {
 				break
 			}
-			e.runtime.setError(fmt.Errorf("read udp: %w", err))
 			if errors.Is(err, errUDPPacketInfoMissing) {
+				e.runtime.setUDPError(fmt.Errorf("read udp: %w", err))
 				continue
 			}
+			e.runtime.setUDPListenerError(fmt.Errorf("read udp: %w", err))
 			break
 		}
 		if !e.runtime.clientAllowed(packet.client.Addr()) {
-			e.runtime.setError(fmt.Errorf("rejected udp source %s: source is not allowed", packet.client))
+			e.runtime.setUDPError(fmt.Errorf("rejected udp source %s: source is not allowed", packet.client))
 			continue
 		}
 		e.forwardDatagram(packet, buffer[:n])
@@ -190,14 +191,14 @@ func (e *udpEndpoint) forwardDatagram(packet udpPacket, payload []byte) {
 	if session == nil {
 		if len(e.sessions) >= e.runtime.spec.maxConns {
 			e.mu.Unlock()
-			e.runtime.setError(fmt.Errorf("udp session limit reached (%d)", e.runtime.spec.maxConns))
+			e.runtime.setUDPError(fmt.Errorf("udp session limit reached (%d)", e.runtime.spec.maxConns))
 			return
 		}
 		target := netip.AddrPortFrom(e.runtime.spec.target.addr, e.runtime.spec.target.port)
 		conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(target))
 		if err != nil {
 			e.mu.Unlock()
-			e.runtime.setError(fmt.Errorf("dial udp target: %w", err))
+			e.runtime.setUDPError(fmt.Errorf("dial udp target: %w", err))
 			return
 		}
 		now := time.Now().UnixNano()
@@ -223,7 +224,7 @@ func (e *udpEndpoint) forwardDatagram(packet udpPacket, payload []byte) {
 
 	_ = session.conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
 	if _, err := session.conn.Write(payload); err != nil {
-		e.runtime.setError(fmt.Errorf("write udp target: %w", err))
+		e.runtime.setUDPError(fmt.Errorf("write udp target: %w", err))
 		e.removeSession(session)
 		return
 	}
@@ -243,16 +244,17 @@ func (e *udpEndpoint) receiveSession(session *udpSession) {
 		n, _, err := session.conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				e.runtime.setError(fmt.Errorf("read udp target: %w", err))
+				e.runtime.setUDPError(fmt.Errorf("read udp target: %w", err))
 			}
 			return
 		}
 		session.lastSeen.Store(time.Now().UnixNano())
+		e.runtime.udpTargetReplied()
 
 		err = e.writeDatagram(buffer[:n], session)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				e.runtime.setError(fmt.Errorf("write udp client: %w", err))
+				e.runtime.setUDPError(fmt.Errorf("write udp client: %w", err))
 				return
 			}
 			return
