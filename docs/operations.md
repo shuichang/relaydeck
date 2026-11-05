@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.5
+  | bash -s -- --version v0.1.6
 ```
 
 首次创建证书时，默认优先读取本机路由及网卡上的公网 IPv4，再读取公网 IPv6；没有合适的本机地址时，按 IPv4/IPv6 使用多个 HTTPS 检测接口。外部请求有连接及总时限、绕过代理环境变量，并验证返回的确实是可用 IP 候选；单个接口失败不会直接中止安装。自动识别失败不表示服务器没有公网 IP。NAT、双线或多出口环境可显式指定入口 IP：
@@ -108,7 +108,7 @@ sudo systemctl restart relaydeck
 
 ## 在设置页管理 SSL 证书
 
-v0.1.5 起，面板导航增加“设置”，可直接管理管理入口的 HTTPS 证书：
+v0.1.6 起，面板导航增加“设置”，可直接管理管理入口的 HTTPS 证书：
 
 | 来源 | 填写方式 | 更新行为 |
 | --- | --- | --- |

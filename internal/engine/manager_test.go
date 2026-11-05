@@ -145,6 +145,11 @@ func helperManager(t *testing.T, dir string) (*Manager, string) {
 	t.Setenv("RELAYDECK_ENGINE_HELPER", "1")
 	t.Setenv("RELAYDECK_ENGINE_RECORD", record)
 	t.Setenv("RELAYDECK_ENGINE_HELPER_STATE", filepath.Join(dir, "helper-state"))
+	// Re-executed fixture processes inherit the race-instrumented test binary.
+	// Its default one-second exit sleep would make intentional 30 ms crashes
+	// look stable to our shortened restart windows. Keep race detection enabled
+	// while removing that artificial delay from subsequently started helpers.
+	t.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
 	manager := New(filepath.Join(dir, "data"), executable)
 	t.Cleanup(manager.Close)
 	return manager, record
