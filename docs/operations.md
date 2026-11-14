@@ -30,8 +30,17 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.7
+  | bash -s -- --version v0.1.8
 ```
+
+管理面板默认监听 `9443/TCP`。安装时可以自定义端口：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
+  | bash -s -- --port 18443
+```
+
+也可以设置 `RELAYDECK_PANEL_PORT=18443`。`--port` 优先；更新时没有新端口参数会保留现有 systemd 单元的端口。端口范围为 `1–65535`，云安全组和主机防火墙需要同步放行。
 
 首次创建证书时，默认优先读取本机路由及网卡上的公网 IPv4，再读取公网 IPv6；没有合适的本机地址时，按 IPv4/IPv6 使用多个 HTTPS 检测接口。外部请求有连接及总时限、绕过代理环境变量，并验证返回的确实是可用 IP 候选；单个接口失败不会直接中止安装。自动识别失败不表示服务器没有公网 IP。NAT、双线或多出口环境可显式指定入口 IP：
 
@@ -42,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 请替换为当前这台机器的入口地址。IPv6 不带方括号或端口；`RELAYDECK_PUBLIC_IP` 要设置给管道右侧的 `bash`。已有完整证书和认证的更新流程不会重新探测或改写它们。
 
-安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制及预期版本、备份上一个二进制和 systemd unit、原子替换、重新加载 systemd、启动服务并验证健康身份。健康判定要求 unit 连续保持 active、MainPID 稳定且存活、`9443` 的 listen socket 属于该 MainPID，同时本机 `https://localhost:9443/healthz` 返回 HTTP 200 且 JSON 的 `service` 为 `relaydeck`、`version` 与刚下载二进制一致。任一项失败时，脚本成对恢复上一个二进制和原 unit；首次安装失败时移除部分安装并停止服务。
+安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制及预期版本、备份上一个二进制和 systemd unit、原子替换、重新加载 systemd、启动服务并验证健康身份。健康判定要求 unit 连续保持 active、MainPID 稳定且存活、配置管理端口的 listen socket 属于该 MainPID，同时本机对应端口的 `/healthz` 返回 HTTP 200 且 JSON 的 `service` 为 `relaydeck`、`version` 与刚下载二进制一致。任一项失败时，脚本成对恢复上一个二进制和原 unit；首次安装失败时移除部分安装并停止服务。
 
 重复安装会更新单元和程序，保留：
 
@@ -81,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ## 网络与端口
 
-RelayDeck 默认监听所有接口的 `9443/TCP`。安装器不执行 `iptables`、`nft`、`ufw`、`firewalld` 或云安全组变更，也不会修改任何全局 sysctl。应自行限制管理端口的来源，并按规则开放实际需要的中转端口。
+RelayDeck 默认监听所有接口的 `9443/TCP`，也可以通过安装参数改成其他单个 TCP 端口。安装器不执行 `iptables`、`nft`、`ufw`、`firewalld` 或云安全组变更，也不会修改任何全局 sysctl。应自行限制管理端口的来源，并按规则开放实际需要的中转端口。
 
 服务单元只保留 `CAP_NET_BIND_SERVICE`，允许规则监听 1024 以下端口。该单元关闭了 TUN、TProxy 等所需的其他能力；需要这些模式的主动内核配置应单独评估，不应通过放宽整个单元权限来实现。
 

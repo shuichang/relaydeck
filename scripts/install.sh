@@ -16,14 +16,16 @@ readonly PREVIOUS_UNIT="${DATA_DIR}/.relaydeck-previous.service"
 usage() {
   cat <<'EOF'
 Usage:
-  install.sh [--version vX.Y.Z]
+  install.sh [--version vX.Y.Z] [--port PORT]
   install.sh --uninstall
 
 Environment:
   RELAYDECK_VERSION     Release tag, for example v0.1.1
   RELAYDECK_PUBLIC_IP   Explicit IPv4/IPv6 entry address for the certificate
+  RELAYDECK_PANEL_PORT  Management HTTPS port; --port takes precedence
 
 Re-running the installer performs an update and preserves auth/configuration.
+If --port and RELAYDECK_PANEL_PORT are omitted, an existing unit port is kept.
 Uninstall keeps /var/lib/relaydeck and /etc/relaydeck.
 EOF
 }
@@ -37,7 +39,28 @@ warn() {
   printf 'relaydeck installer: warning: %s\n' "$*" >&2
 }
 
+# BEGIN PANEL PORT HELPERS
+relaydeck_validate_panel_port() {
+  local port="$1"
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
+  ((10#$port <= 65535))
+}
+
+relaydeck_panel_port_from_unit() {
+  local unit_path="$1"
+  local port
+  [[ -f "$unit_path" ]] || return 1
+  port="$(
+    sed -n 's/^ExecStart=.*--listen :\([0-9][0-9]*\)[[:space:]].*/\1/p' \
+      "$unit_path" | sed -n '1p'
+  )"
+  relaydeck_validate_panel_port "$port" || return 1
+  printf '%s\n' "$port"
+}
+# END PANEL PORT HELPERS
+
 version="${RELAYDECK_VERSION:-}"
+panel_port="${RELAYDECK_PANEL_PORT:-}"
 uninstall=0
 
 while (($#)); do
@@ -45,6 +68,11 @@ while (($#)); do
     --version)
       (($# >= 2)) || die "--version requires a tag"
       version="$2"
+      shift 2
+      ;;
+    --port)
+      (($# >= 2)) || die "--port requires a number"
+      panel_port="$2"
       shift 2
       ;;
     --uninstall)
@@ -75,6 +103,15 @@ if ((uninstall)); then
   printf 'To reinstall, run this script again without --uninstall.\n'
   exit 0
 fi
+
+if [[ -z "$panel_port" && -f "$UNIT" ]]; then
+  if existing_panel_port="$(relaydeck_panel_port_from_unit "$UNIT")"; then
+    panel_port="$existing_panel_port"
+  fi
+fi
+panel_port="${panel_port:-9443}"
+relaydeck_validate_panel_port "$panel_port" \
+  || die "panel port must be an integer between 1 and 65535: ${panel_port}"
 
 for cmd in curl tar sha256sum install od tr ss; do
   command -v "$cmd" >/dev/null 2>&1 || die "required command not found: $cmd"
@@ -481,7 +518,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/var/lib/relaydeck
-ExecStart=/usr/local/bin/relaydeck serve --data /var/lib/relaydeck --listen :9443 --tls-cert /etc/relaydeck/tls.crt --tls-key /etc/relaydeck/tls.key
+ExecStart=/usr/local/bin/relaydeck serve --data /var/lib/relaydeck --listen :${panel_port} --tls-cert /etc/relaydeck/tls.crt --tls-key /etc/relaydeck/tls.key
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=20s
@@ -572,7 +609,7 @@ fi
 healthy=0
 if ((install_ok)); then
   wait_for_relaydeck_health \
-    relaydeck.service 9443 "$expected_health_version" 30 5 \
+    relaydeck.service "$panel_port" "$expected_health_version" 30 5 \
     && healthy=1
 fi
 
@@ -580,7 +617,7 @@ if ((healthy == 0)); then
   systemctl status relaydeck.service --no-pager -l >&2 || true
   systemctl show --property=ActiveState --property=SubState --property=MainPID \
     relaydeck.service >&2 || true
-  ss -H -ltnp 'sport = :9443' >&2 || true
+  ss -H -ltnp "sport = :${panel_port}" >&2 || true
   restore_previous
   if ((had_previous_bin && had_previous_unit)); then
     systemctl restart relaydeck.service || true
@@ -598,7 +635,7 @@ if [[ "$management_host" == *:* ]]; then
   management_host="[${management_host}]"
 fi
 printf '\nRelayDeck %s is installed and healthy.\n' "$version"
-printf 'Management: https://%s:9443/\n' "$management_host"
+printf 'Management: https://%s:%s/\n' "$management_host" "$panel_port"
 printf 'Certificate: %s\n' "$CERT_FILE"
 printf 'The browser will show a self-signed certificate warning. Verify the IP and certificate fingerprint before adding a one-site exception.\n'
 if ((created_auth)); then

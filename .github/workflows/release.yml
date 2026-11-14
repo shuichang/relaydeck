@@ -53,10 +53,14 @@ jobs:
           bash -n scripts/install-sing-box.sh
           bash -n scripts/test-installer.sh
           bash -n scripts/test-install-ip.sh
-          shellcheck scripts/install.sh scripts/install-sing-box.sh scripts/test-installer.sh scripts/test-install-ip.sh
+          bash -n scripts/test-install-port.sh
+          shellcheck scripts/install.sh scripts/install-sing-box.sh scripts/test-installer.sh scripts/test-install-ip.sh scripts/test-install-port.sh
 
       - name: Installer public IP regression
         run: bash scripts/test-install-ip.sh
+
+      - name: Installer panel port regression
+        run: bash scripts/test-install-port.sh
 
       - name: Installer health regression
         run: bash scripts/test-installer.sh
