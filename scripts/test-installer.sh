@@ -289,7 +289,7 @@ pass "MainPID, listener ownership, and service/version identity all match"
 
 rc_active=1
 rc-service() {
-  case "${1:-}" in
+  case "${2:-}" in
     status)
       [[ "$rc_active" -eq 1 ]]
       ;;
