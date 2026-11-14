@@ -7,7 +7,7 @@
 | 项目 | 路径或值 |
 | --- | --- |
 | 程序 | `/usr/local/bin/relaydeck` |
-| 服务 | `relaydeck.service` |
+| 服务 | systemd 为 `relaydeck.service`；OpenRC 为 `/etc/init.d/relaydeck` |
 | 认证与运行数据 | `/var/lib/relaydeck` |
 | TLS 与配置 | `/etc/relaydeck` |
 | 管理监听 | `:9443`（HTTPS） |
@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.8
+  | bash -s -- --version v0.1.9
 ```
 
 管理面板默认监听 `9443/TCP`。安装时可以自定义端口：
@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
   | bash -s -- --port 18443
 ```
 
-也可以设置 `RELAYDECK_PANEL_PORT=18443`。`--port` 优先；更新时没有新端口参数会保留现有 systemd 单元的端口。端口范围为 `1–65535`，云安全组和主机防火墙需要同步放行。
+也可以设置 `RELAYDECK_PANEL_PORT=18443`。`--port` 优先；更新时没有新端口参数会保留现有服务配置的端口。端口范围为 `1–65535`，云安全组和主机防火墙需要同步放行。
 
 首次创建证书时，默认优先读取本机路由及网卡上的公网 IPv4，再读取公网 IPv6；没有合适的本机地址时，按 IPv4/IPv6 使用多个 HTTPS 检测接口。外部请求有连接及总时限、绕过代理环境变量，并验证返回的确实是可用 IP 候选；单个接口失败不会直接中止安装。自动识别失败不表示服务器没有公网 IP。NAT、双线或多出口环境可显式指定入口 IP：
 
@@ -51,18 +51,26 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 请替换为当前这台机器的入口地址。IPv6 不带方括号或端口；`RELAYDECK_PUBLIC_IP` 要设置给管道右侧的 `bash`。已有完整证书和认证的更新流程不会重新探测或改写它们。
 
-安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制及预期版本、备份上一个二进制和 systemd unit、原子替换、重新加载 systemd、启动服务并验证健康身份。健康判定要求 unit 连续保持 active、MainPID 稳定且存活、配置管理端口的 listen socket 属于该 MainPID，同时本机对应端口的 `/healthz` 返回 HTTP 200 且 JSON 的 `service` 为 `relaydeck`、`version` 与刚下载二进制一致。任一项失败时，脚本成对恢复上一个二进制和原 unit；首次安装失败时移除部分安装并停止服务。
+安装脚本执行以下顺序：架构识别、下载 Release 归档和 `checksums.txt`、校验 SHA-256、校验二进制及预期版本、备份上一个二进制和服务配置、原子替换、重新加载或重新读取服务配置、启动服务并验证健康身份。健康判定要求服务连续保持 active、MainPID 稳定且存活、配置管理端口的 listen socket 属于该 MainPID，同时本机对应端口的 `/healthz` 返回 HTTP 200 且 JSON 的 `service` 为 `relaydeck`、`version` 与刚下载二进制一致。任一项失败时，脚本成对恢复上一个二进制和原服务配置；首次安装失败时移除部分安装并停止服务。
 
 重复安装会更新单元和程序，保留：
 
 - `/var/lib/relaydeck/auth.json` 与配置；
 - `/etc/relaydeck` 内的配置与 TLS 文件；
 - `/var/lib/relaydeck/.relaydeck-previous`，上一版本的二进制备份；
-- `/var/lib/relaydeck/.relaydeck-previous.service`，上一版本的 systemd unit 备份。
+- `/var/lib/relaydeck/.relaydeck-previous.service` 或 `.relaydeck-previous.init`，上一版本的服务配置备份。
 
 更新流程不会调用 `relaydeck init`，因此不会重置密码。自签证书存在时也不会重新生成。
 
-安装与更新只管理 `relaydeck.service` 和本项目自己的文件。它不会停止、改动或卸载服务器上已有的其他服务。
+安装与更新只管理 RelayDeck 自己的服务文件和程序。它不会停止、改动或卸载服务器上已有的其他服务。
+
+Alpine/OpenRC 可用以下命令管理服务：
+
+```bash
+rc-service relaydeck status
+rc-service relaydeck restart
+rc-update show | grep relaydeck
+```
 
 如果管理员密码丢失，可用 root 权限显式重置。下面的密码不会出现在命令参数或 shell 历史中；`printf` 的独立管道与执行 curl 脚本的 stdin 互不复用：
 
@@ -86,7 +94,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
   | bash -s -- --uninstall
 ```
 
-卸载只停止并禁用服务，删除 `relaydeck.service` 和 `/usr/local/bin/relaydeck`。`/etc/relaydeck` 与 `/var/lib/relaydeck` 默认保留。彻底删除数据需要由管理员确认备份后手动处理；脚本不会删除用户数据或其他软件。
+卸载只停止并禁用当前服务管理器中的 RelayDeck 服务，删除服务文件和 `/usr/local/bin/relaydeck`。`/etc/relaydeck` 与 `/var/lib/relaydeck` 默认保留。彻底删除数据需要由管理员确认备份后手动处理；脚本不会删除用户数据或其他软件。
 
 ## 网络与端口
 
@@ -158,9 +166,18 @@ relaydeck version
 sudo relaydeck check --data /var/lib/relaydeck
 ```
 
+Alpine/OpenRC 对应检查：
+
+```bash
+rc-service relaydeck status
+curl -kfsS https://localhost:9443/healthz
+relaydeck version
+relaydeck check --data /var/lib/relaydeck
+```
+
 `curl -k` 只用于本机确认服务是否响应，不应用于传播证书或关闭客户端验证。外部访问应通过浏览器接受自签例外，或导入明确的证书指纹。
 
-安装健康检查不只看 `curl` 的 200。监听端口被其他 HTTPS 服务占用时，RelayDeck 的 MainPID 不拥有该 socket，或响应中的服务名/版本不一致，安装都会失败并回滚。安装器只停止自己的 `relaydeck.service`，不会结束占用端口的外部进程。
+安装健康检查不只看 `curl` 的 200。监听端口被其他 HTTPS 服务占用时，RelayDeck 的 MainPID 不拥有该 socket，或响应中的服务名/版本不一致，安装都会失败并回滚。安装器只停止自己的 RelayDeck 服务，不会结束占用端口的外部进程。
 
 可用独立随机回环端口验证这些判定和 tar 管道行为。测试需要 `go`、`openssl`、`curl` 和 `ss`，使用替身 systemd 状态与现场构建的临时 Go HTTPS 服务，明确避开 `9443`：
 

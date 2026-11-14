@@ -61,11 +61,16 @@ for cmd in awk curl go openssl sed ss tar; do
   command -v "$cmd" >/dev/null 2>&1 || fail "required test command not found: $cmd"
 done
 
+sed -n '/^# BEGIN SERVICE HELPERS$/,/^# END SERVICE HELPERS$/p' \
+  "$installer" > "${tmpdir}/service-helpers.sh"
+[[ -s "${tmpdir}/service-helpers.sh" ]] || fail "service helper block was not found"
 sed -n '/^# BEGIN HEALTH CHECK HELPERS$/,/^# END HEALTH CHECK HELPERS$/p' \
-  "$installer" > "${tmpdir}/helpers.sh"
-[[ -s "${tmpdir}/helpers.sh" ]] || fail "health helper block was not found"
+  "$installer" >> "${tmpdir}/service-helpers.sh"
 # shellcheck source=/dev/null
-source "${tmpdir}/helpers.sh"
+source "${tmpdir}/service-helpers.sh"
+service_manager="systemd"
+service_name="relaydeck.service"
+OPENRC_PIDFILE="${tmpdir}/relaydeck.pid"
 
 test_active=1
 test_main_pid=""
@@ -280,6 +285,37 @@ relaydeck_health_probe relaydeck.service "$test_port" v0.1.1 \
     fail "matching unit PID, listener, and health identity should pass"
   }
 pass "MainPID, listener ownership, and service/version identity all match"
+
+rc_active=1
+rc-service() {
+  case "${1:-}" in
+    status)
+      [[ "$rc_active" -eq 1 ]]
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+rc-update() {
+  return 0
+}
+printf '%s\n' "$server_pid" > "$OPENRC_PIDFILE"
+service_manager="openrc"
+service_name="relaydeck"
+relaydeck_health_probe relaydeck "$test_port" v0.1.1 \
+  || {
+    helper_diagnostics
+    fail "OpenRC pidfile, listener, and health identity should pass"
+  }
+pass "OpenRC service health verification uses its pidfile"
+rc_active=0
+if relaydeck_health_probe relaydeck "$test_port" v0.1.1; then
+  fail "inactive OpenRC service was accepted"
+fi
+pass "inactive OpenRC service is rejected"
+service_manager="systemd"
+service_name="relaydeck.service"
 
 # shellcheck disable=SC2310 # the probe returns explicitly and is expected to fail here
 if relaydeck_health_probe relaydeck.service "$test_port" v9.9.9; then

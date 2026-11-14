@@ -49,15 +49,23 @@ cat > "${tmpdir}/relaydeck.service" <<'EOF'
 [Service]
 ExecStart=/usr/local/bin/relaydeck serve --data /var/lib/relaydeck --listen :18443 --tls-cert /etc/relaydeck/tls.crt --tls-key /etc/relaydeck/tls.key
 EOF
-[[ "$(relaydeck_panel_port_from_unit "${tmpdir}/relaydeck.service")" == "18443" ]] \
+[[ "$(relaydeck_panel_port_from_service "${tmpdir}/relaydeck.service")" == "18443" ]] \
   || fail "existing unit port was not detected"
 pass "existing unit port is preserved"
+
+cat > "${tmpdir}/relaydeck.init" <<'EOF'
+#!/sbin/openrc-run
+command_args="serve --data /var/lib/relaydeck --listen :28543 --tls-cert /etc/relaydeck/tls.crt --tls-key /etc/relaydeck/tls.key"
+EOF
+[[ "$(relaydeck_panel_port_from_service "${tmpdir}/relaydeck.init")" == "28543" ]] \
+  || fail "existing OpenRC service port was not detected"
+pass "existing OpenRC service port is preserved"
 
 cat > "${tmpdir}/invalid.service" <<'EOF'
 [Service]
 ExecStart=/usr/local/bin/relaydeck serve --data /var/lib/relaydeck --listen [::]:0 --tls-cert /etc/relaydeck/tls.crt --tls-key /etc/relaydeck/tls.key
 EOF
-if relaydeck_panel_port_from_unit "${tmpdir}/invalid.service"; then
+if relaydeck_panel_port_from_service "${tmpdir}/invalid.service"; then
   fail "invalid existing unit port was accepted"
 fi
 pass "invalid existing unit port is ignored"

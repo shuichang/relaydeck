@@ -9,9 +9,12 @@ readonly CONFIG_DIR="/etc/relaydeck"
 readonly AUTH_FILE="${DATA_DIR}/auth.json"
 readonly CERT_FILE="${CONFIG_DIR}/tls.crt"
 readonly KEY_FILE="${CONFIG_DIR}/tls.key"
-readonly UNIT="/etc/systemd/system/relaydeck.service"
+readonly SYSTEMD_UNIT="/etc/systemd/system/relaydeck.service"
+readonly OPENRC_INIT="/etc/init.d/relaydeck"
 readonly PREVIOUS="${DATA_DIR}/.relaydeck-previous"
-readonly PREVIOUS_UNIT="${DATA_DIR}/.relaydeck-previous.service"
+readonly PREVIOUS_SYSTEMD_UNIT="${DATA_DIR}/.relaydeck-previous.service"
+readonly PREVIOUS_OPENRC_INIT="${DATA_DIR}/.relaydeck-previous.init"
+readonly OPENRC_PIDFILE="/run/relaydeck.pid"
 
 usage() {
   cat <<'EOF'
@@ -46,13 +49,13 @@ relaydeck_validate_panel_port() {
   ((10#$port <= 65535))
 }
 
-relaydeck_panel_port_from_unit() {
-  local unit_path="$1"
+relaydeck_panel_port_from_service() {
+  local service_path="$1"
   local port
-  [[ -f "$unit_path" ]] || return 1
+  [[ -f "$service_path" ]] || return 1
   port="$(
-    sed -n 's/^ExecStart=.*--listen :\([0-9][0-9]*\)[[:space:]].*/\1/p' \
-      "$unit_path" | sed -n '1p'
+    sed -n 's/.*--listen :\([0-9][0-9]*\).*/\1/p' \
+      "$service_path" | sed -n '1p'
   )"
   relaydeck_validate_panel_port "$port" || return 1
   printf '%s\n' "$port"
@@ -91,21 +94,57 @@ done
 
 [[ "${EUID}" -eq 0 ]] || die "run as root"
 [[ "$(uname -s)" == "Linux" ]] || die "only Linux is supported"
-command -v systemctl >/dev/null 2>&1 || die "systemctl is required"
-[[ -d /run/systemd/system ]] || die "systemd is not the active service manager"
+
+service_manager=""
+service_name=""
+service_file=""
+previous_service_file=""
+service_file_mode=""
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  service_manager="systemd"
+  service_name="relaydeck.service"
+  service_file="$SYSTEMD_UNIT"
+  previous_service_file="$PREVIOUS_SYSTEMD_UNIT"
+  service_file_mode=0644
+elif command -v rc-service >/dev/null 2>&1 &&
+  command -v rc-update >/dev/null 2>&1 &&
+  { command -v openrc-run >/dev/null 2>&1 || [[ -x /sbin/openrc-run ]]; }; then
+  service_manager="openrc"
+  service_name="relaydeck"
+  service_file="$OPENRC_INIT"
+  previous_service_file="$PREVIOUS_OPENRC_INIT"
+  service_file_mode=0755
+else
+  die "an active systemd or OpenRC service manager is required"
+fi
 
 if ((uninstall)); then
-  systemctl disable --now relaydeck.service >/dev/null 2>&1 || true
-  rm -f -- "$UNIT" "$BIN"
-  systemctl daemon-reload
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || true
+    rm -f -- "$service_file"
+    systemctl daemon-reload
+  else
+    rc-service "$service_name" stop >/dev/null 2>&1 || true
+    rc-update del "$service_name" default >/dev/null 2>&1 || true
+    rm -f -- "$service_file"
+  fi
+  rm -f -- "$BIN"
   printf 'RelayDeck stopped and removed.\n'
   printf 'Preserved: %s %s\n' "$DATA_DIR" "$CONFIG_DIR"
   printf 'To reinstall, run this script again without --uninstall.\n'
   exit 0
 fi
 
-if [[ -z "$panel_port" && -f "$UNIT" ]]; then
-  if existing_panel_port="$(relaydeck_panel_port_from_unit "$UNIT")"; then
+if ! command -v ss >/dev/null 2>&1; then
+  if command -v apk >/dev/null 2>&1; then
+    printf 'relaydeck installer: installing Alpine dependency iproute2 for health checks...\n' >&2
+    apk add --no-cache iproute2 >/dev/null \
+      || die "could not install Alpine dependency iproute2"
+  fi
+fi
+
+if [[ -z "$panel_port" && -f "$service_file" ]]; then
+  if existing_panel_port="$(relaydeck_panel_port_from_service "$service_file")"; then
     panel_port="$existing_panel_port"
   fi
 fi
@@ -312,6 +351,73 @@ relaydeck_detect_public_ip() {
 }
 # END PUBLIC IP HELPERS
 
+# BEGIN SERVICE HELPERS
+relaydeck_service_daemon_reload() {
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl daemon-reload
+  fi
+}
+
+relaydeck_service_is_active() {
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl is-active --quiet "$service_name"
+  else
+    rc-service "$service_name" status >/dev/null 2>&1
+  fi
+}
+
+relaydeck_service_main_pid() {
+  local pid
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl show --property=MainPID --value "$service_name" 2>/dev/null
+    return
+  fi
+  [[ -r "$OPENRC_PIDFILE" ]] || return 1
+  read -r pid < "$OPENRC_PIDFILE" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+relaydeck_service_enable() {
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl enable "$service_name" >/dev/null
+  else
+    rc-update add "$service_name" default >/dev/null
+  fi
+}
+
+relaydeck_service_restart() {
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl restart "$service_name"
+  else
+    rc-service "$service_name" stop >/dev/null 2>&1 || true
+    rc-service "$service_name" start
+  fi
+}
+
+relaydeck_service_status() {
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl status "$service_name" --no-pager -l >&2 || true
+    systemctl show --property=ActiveState --property=SubState --property=MainPID \
+      "$service_name" >&2 || true
+  else
+    rc-service "$service_name" status >&2 || true
+    if [[ -r "$OPENRC_PIDFILE" ]]; then
+      printf 'relaydeck pidfile: %s\n' "$(< "$OPENRC_PIDFILE")" >&2
+    fi
+  fi
+}
+
+relaydeck_service_stop_disable() {
+  if [[ "$service_manager" == "systemd" ]]; then
+    systemctl disable --now "$service_name" >/dev/null 2>&1 || true
+  else
+    rc-service "$service_name" stop >/dev/null 2>&1 || true
+    rc-update del "$service_name" default >/dev/null 2>&1 || true
+  fi
+}
+# END SERVICE HELPERS
+
 # BEGIN HEALTH CHECK HELPERS
 relaydeck_probe_pid=""
 
@@ -354,8 +460,8 @@ relaydeck_health_probe() {
   local main_pid health_file status body
 
   relaydeck_probe_pid=""
-  systemctl is-active --quiet "$unit" || return 1
-  main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)" || return 1
+  relaydeck_service_is_active || return 1
+  main_pid="$(relaydeck_service_main_pid)" || return 1
   [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || return 1
   kill -0 "$main_pid" 2>/dev/null || return 1
   relaydeck_port_owned_by_pid "$port" "$main_pid" || return 1
@@ -505,8 +611,9 @@ fi
 
 "${tmpdir}/relaydeck" check --data "$DATA_DIR"
 
-unit_tmp="${tmpdir}/relaydeck.service"
-cat > "$unit_tmp" <<'EOF'
+if [[ "$service_manager" == "systemd" ]]; then
+  service_tmp="${tmpdir}/relaydeck.service"
+  cat > "$service_tmp" <<EOF
 [Unit]
 Description=RelayDeck TCP/UDP relay panel
 Documentation=https://github.com/shuichang/relaydeck
@@ -565,16 +672,40 @@ SystemCallErrorNumber=EPERM
 [Install]
 WantedBy=multi-user.target
 EOF
+else
+  service_tmp="${tmpdir}/relaydeck.init"
+  cat > "$service_tmp" <<EOF
+#!/sbin/openrc-run
+
+name="relaydeck"
+description="RelayDeck TCP/UDP relay panel"
+command="/usr/local/bin/relaydeck"
+command_args="serve --data /var/lib/relaydeck --listen :${panel_port} --tls-cert /etc/relaydeck/tls.crt --tls-key /etc/relaydeck/tls.key"
+command_user="root:root"
+directory="/var/lib/relaydeck"
+pidfile="${OPENRC_PIDFILE}"
+command_background=true
+retry="SIGTERM/20 SIGKILL/5"
+export GOMEMLIMIT="96MiB"
+export GOGC="50"
+
+depend() {
+	need net
+	after firewall
+}
+EOF
+  chmod 0755 "$service_tmp"
+fi
 
 had_previous_bin=0
-had_previous_unit=0
+had_previous_service=0
 if [[ -x "$BIN" ]]; then
   atomic_install "$BIN" "$PREVIOUS" 0700
   had_previous_bin=1
 fi
-if [[ -f "$UNIT" ]]; then
-  atomic_install "$UNIT" "$PREVIOUS_UNIT" 0600
-  had_previous_unit=1
+if [[ -f "$service_file" ]]; then
+  atomic_install "$service_file" "$previous_service_file" "$service_file_mode"
+  had_previous_service=1
 fi
 
 restore_previous() {
@@ -583,47 +714,45 @@ restore_previous() {
   else
     rm -f -- "$BIN"
   fi
-  if ((had_previous_unit)); then
-    atomic_install "$PREVIOUS_UNIT" "$UNIT" 0644 || true
+  if ((had_previous_service)); then
+    atomic_install "$previous_service_file" "$service_file" "$service_file_mode" || true
   else
-    rm -f -- "$UNIT"
+    rm -f -- "$service_file"
   fi
-  systemctl daemon-reload || true
+  relaydeck_service_daemon_reload || true
 }
 
 install_ok=1
 atomic_install "${tmpdir}/relaydeck" "$BIN" 0755 || install_ok=0
 if ((install_ok)); then
-  atomic_install "$unit_tmp" "$UNIT" 0644 || install_ok=0
+  atomic_install "$service_tmp" "$service_file" "$service_file_mode" || install_ok=0
 fi
 if ((install_ok)); then
-  systemctl daemon-reload || install_ok=0
+  relaydeck_service_daemon_reload || install_ok=0
 fi
 if ((install_ok)); then
-  systemctl enable relaydeck.service >/dev/null || install_ok=0
+  relaydeck_service_enable || install_ok=0
 fi
 if ((install_ok)); then
-  systemctl restart relaydeck.service || install_ok=0
+  relaydeck_service_restart || install_ok=0
 fi
 
 healthy=0
 if ((install_ok)); then
   wait_for_relaydeck_health \
-    relaydeck.service "$panel_port" "$expected_health_version" 30 5 \
+    "$service_name" "$panel_port" "$expected_health_version" 30 5 \
     && healthy=1
 fi
 
 if ((healthy == 0)); then
-  systemctl status relaydeck.service --no-pager -l >&2 || true
-  systemctl show --property=ActiveState --property=SubState --property=MainPID \
-    relaydeck.service >&2 || true
+  relaydeck_service_status
   ss -H -ltnp "sport = :${panel_port}" >&2 || true
   restore_previous
-  if ((had_previous_bin && had_previous_unit)); then
-    systemctl restart relaydeck.service || true
-    warn "new version failed; restored the previous binary and systemd unit"
+  if ((had_previous_bin && had_previous_service)); then
+    relaydeck_service_restart || true
+    warn "new version failed; restored the previous binary and service configuration"
   else
-    systemctl disable --now relaydeck.service >/dev/null 2>&1 || true
+    relaydeck_service_stop_disable
     warn "first installation failed; removed the partial service installation"
   fi
   exit 1
