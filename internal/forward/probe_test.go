@@ -220,9 +220,9 @@ func TestProbeValidationCancellationAndLoop(t *testing.T) {
 	m := NewManager()
 	defer m.Close()
 	invalid := rule
-	invalid.Target = "[::1]:443"
+	invalid.Target = "[::1"
 	if _, err := m.Probe(context.Background(), invalid); err == nil {
-		t.Fatal("non-IPv4 target was accepted")
+		t.Fatal("invalid IPv6 target was accepted")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

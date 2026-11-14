@@ -1,6 +1,6 @@
 # RelayDeck 运维手册
 
-目标域名会在启动或保存规则时解析为 IPv4，当前没有按 DNS TTL 定时刷新；记录变化后需要重新保存规则或重启服务。如果启动时出现解析或端口占用错误，管理面板仍会启动并显示待修复规则。转发配置变更失败会恢复旧监听，但已关闭的活动连接不能恢复。
+目标可填写 IPv4/IPv6 字面量或主机名。主机名会在启动或保存规则时解析到 IPv4/IPv6 地址，同时返回两族地址时优先使用 IPv4；当前没有按 DNS TTL 定时刷新，也没有跨地址族的故障转移，记录变化后需要重新保存规则或重启服务。IPv6 目标端口要写成方括号形式，例如 `[2001:db8::1]:443`。如果启动时出现解析或端口占用错误，管理面板仍会启动并显示待修复规则。转发配置变更失败会恢复旧监听，但已关闭的活动连接不能恢复。
 
 ## 安装布局
 
@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.6
+  | bash -s -- --version v0.1.7
 ```
 
 首次创建证书时，默认优先读取本机路由及网卡上的公网 IPv4，再读取公网 IPv6；没有合适的本机地址时，按 IPv4/IPv6 使用多个 HTTPS 检测接口。外部请求有连接及总时限、绕过代理环境变量，并验证返回的确实是可用 IP 候选；单个接口失败不会直接中止安装。自动识别失败不表示服务器没有公网 IP。NAT、双线或多出口环境可显式指定入口 IP：
@@ -85,6 +85,8 @@ RelayDeck 默认监听所有接口的 `9443/TCP`。安装器不执行 `iptables`
 
 服务单元只保留 `CAP_NET_BIND_SERVICE`，允许规则监听 1024 以下端口。该单元关闭了 TUN、TProxy 等所需的其他能力；需要这些模式的主动内核配置应单独评估，不应通过放宽整个单元权限来实现。
 
+转发规则监听 `:端口`、`0.0.0.0:端口`、`[::]:端口` 或具体 IPv4/IPv6 地址。`0.0.0.0:端口` 只覆盖 IPv4；`:端口` 与 `[::]:端口` 绑定 IPv6 通配地址，在 Linux 双栈监听下同时接受 IPv4。目标地址支持 IPv4、带方括号的 IPv6 以及主机名。原生转发属于透明 L4：只搬运 TCP 流或 UDP 报文，不保留原始源 IP，不注入 PROXY protocol，不改写 SNI，不终止 TLS，也不解析 VLESS、Reality 或 XHTTP；协议端点和外层加密必须由两端配置。
+
 自签证书的公网启用条件：
 
 - 服务器的入口公网 IPv4 或 IPv6 地址已在证书的 IP SAN 中；
@@ -123,13 +125,13 @@ v0.1.6 起，面板导航增加“设置”，可直接管理管理入口的 HTT
 
 初次运行新版也会保存默认文件的快照。如果一份之前已启用的证书在停机期间过期，服务仍加载它，以便管理员通过浏览器的证书警告进入设置页修复；过期证书不会变成受信任的有效证书。
 
-默认 systemd 沙箱会隐藏 `/root`、`/home` 等目录，所以不应直接引用这些位置的证书。服务器文件路径模式可读取 `/etc/letsencrypt/live/域名/fullchain.pem` 与 `privkey.pem`，或应用数据目录中的证书；私钥需要保持仅服务管理员可读。选择“上传 PEM”时，数据会写入应用数据目录，无需改变 `/etc/relaydeck` 的只读挂载。
+当前安装器的 systemd 沙箱继续隐藏 `/root`、`/home`，只读开放 `/root/cert` 与 `/root/.acme.sh`，服务器文件路径模式可以读取这两个目录中的证书但不会写入。其他位置请使用 `/etc/letsencrypt/live/域名/fullchain.pem`、`/etc/ssl` 或应用数据目录中的证书。私钥需要保持仅服务管理员可读。选择“上传 PEM”时，数据会写入应用数据目录，无需改变 `/etc/relaydeck` 的只读挂载。
 
 设置查询不会返回 PEM 或私钥，普通配置导出也不包含 TLS 设置。迁移证书需要单独安全备份 `tls-settings.json`；不要把它提交到 GitHub。若保存的 TLS 设置文件本身被人为损坏，先备份并移走该文件，确认启动参数指定的证书/私钥有效后再启动，可恢复使用默认文件。
 
 ## 规则错误与恢复状态
 
-“运行中”说明本机监听器仍在运行。当前错误和最近错误分开显示，最近错误带发生时间与协议，不再因一条旧超时永久标红。
+“运行中”说明本机监听器仍在运行。当前错误和最近错误分开显示，最近错误带发生时间与协议，不再因一条旧超时永久标红。当前规则只启用 TCP、历史错误来自 UDP 时，标题显示“历史错误（UDP）”，并明确“当前 UDP 未启用；此历史错误不影响当前 TCP”。这条历史记录用于保留故障线索，不代表 TCP 当前有错误。
 
 TCP 建立上游连接成功后清除对应 TCP 临时错误；UDP 收到目标真实回包后才清除对应 UDP 错误。UDP `Dial` 或发送成功不代表目标可达，TCP 恢复也不会清除 UDP 错误。停止的监听器故障必须通过修复监听配置或重新启动规则恢复。探测结果只验证它注明的链路范围，无法证明账号认证或完整隧道业务可用。
 
@@ -220,5 +222,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 | `sing-box-1.14.4-linux-armv7.tar.gz` | `fd164ed45ebc784f657a3e1d0e0ad0f68afdcff864ee57122c2cfed3ddb80a00` |
 
 这些摘要在 2026-11-01 从 GitHub Release API 的资产 digest 读取，并与实际发布的 1.14.4 资产名对应。该 Release 没有单独的 checksum 或签名资产，因此脚本不声称执行了上游签名验证。已经有其他版本时，脚本默认拒绝覆盖；确认升级/回退方案后才使用 `--force`，旧文件会保留为 `sing-box.relaydeck-backup`。
+
+内置模板覆盖 direct、VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks 2022、SSH、WireGuard、VLESS + WebSocket + TLS 和 VLESS + gRPC + TLS；SSH 只承载 TCP，Reality 模板的 UDP 还要求远端支持 XUDP。VLESS 可优先规划 XHTTP 传输，Xray 官方文档也建议从 WebSocket 迁移到 XHTTP；XHTTP 的端点、路径、TLS/Reality 与 HTTP 版本须由兼容客户端和服务端一致配置。当前 sing-box 1.14.4 模板集不含 XHTTP，不要把透明转发能力写成 RelayDeck 会解析 VLESS 或 Reality。
 
 同时运行转发器和主动内核会增加资源消耗。协议矩阵和当前限制见 [research.md](research.md)。

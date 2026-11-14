@@ -940,10 +940,19 @@
     const history = createElement("div", "rule-history");
     const heading = createElement("span", "rule-history-heading");
     const network = runtimeNetworkLabel(rule.last_error_network);
-    heading.append(createElement("strong", "", `最近错误${network ? `（${network}）` : ""}`));
+    const udpHistoryOnTcpRule = rule.network === "tcp" && rule.last_error_network === "udp";
+    const historyLabel = udpHistoryOnTcpRule ? "历史错误" : "最近错误";
+    heading.append(createElement("strong", "", `${historyLabel}${network ? `（${network}）` : ""}`));
     const errorTime = formatRuleEventTime(rule.last_error_at);
     if (errorTime) heading.append(document.createTextNode(` · ${errorTime}`));
     history.append(heading);
+    if (udpHistoryOnTcpRule) {
+      history.append(createElement(
+        "span",
+        "rule-history-pending",
+        "当前 UDP 未启用；此历史错误不影响当前 TCP。",
+      ));
+    }
 
     const errorTimestamp = Date.parse(rule.last_error_at);
     const recoveryTimestamp = Date.parse(rule.last_recovery_at);
@@ -953,6 +962,8 @@
     const recoveryTime = formatRuleEventTime(rule.last_recovery_at);
     if (recoveryTime && recoveryIsNewer) {
       history.append(createElement("span", "rule-history-recovery", `已恢复 · ${recoveryTime}`));
+    } else if (udpHistoryOnTcpRule) {
+      // The current transport note above is the relevant status for this record.
     } else if (recoveryTime) {
       history.append(createElement(
         "span",
@@ -1193,16 +1204,40 @@
 
   function validateTarget(value) {
     if (/\s/.test(value)) return "目标地址不能包含空格。";
-    if (value.startsWith("[")) return "目标必须是 IPv4 字面量或解析到 IPv4 的主机名。";
-    const separator = value.lastIndexOf(":");
-    if (separator <= 0 || separator === value.length - 1) {
-      return "目标地址格式应类似 203.0.113.1:443。";
-    }
-    const host = value.slice(0, separator);
-    const port = Number(value.slice(separator + 1));
-    if (!/^[A-Za-z0-9.-]+$/.test(host)) return "目标主机名或 IPv4 地址格式无效。";
+    const match = value.match(/^(\[[^\]]+\]|[A-Za-z0-9.-]+):(\d{1,5})$/);
+    if (!match) return "目标地址格式应类似 203.0.113.1:443 或 [2001:db8::1]:443。";
+    const host = match[1];
+    const port = Number(match[2]);
     if (!Number.isInteger(port) || port < 1 || port > 65535) return "目标端口必须在 1 到 65535 之间。";
+    if (host.startsWith("[")) {
+      const address = host.slice(1, -1);
+      if (!isValidIPv6Literal(address)) {
+        return "目标 IPv6 地址格式无效。";
+      }
+    } else if (!/^[A-Za-z0-9.-]+$/.test(host)) {
+      return "目标主机名或 IP 地址格式无效。";
+    }
     return "";
+  }
+
+  function isValidIPv6Literal(value) {
+    const zoneIndex = value.indexOf("%");
+    const address = zoneIndex >= 0 ? value.slice(0, zoneIndex) : value;
+    const zone = zoneIndex >= 0 ? value.slice(zoneIndex + 1) : "";
+    if (!address.includes(":") || (zoneIndex >= 0 && !/^[A-Za-z0-9_.-]+$/.test(zone))) return false;
+    const groups = part => {
+      if (!part) return [];
+      const values = part.split(":");
+      if (values.some(group => !group || !/^[0-9A-Fa-f]{1,4}$/.test(group))) return null;
+      return values;
+    };
+    const halves = address.split("::");
+    if (halves.length > 2) return false;
+    const left = groups(halves[0]);
+    const right = groups(halves.length === 2 ? halves[1] : "");
+    if (!left || !right) return false;
+    const count = left.length + right.length;
+    return halves.length === 2 ? count < 8 : count === 8;
   }
 
   function readRuleForm() {

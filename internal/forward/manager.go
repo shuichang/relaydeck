@@ -73,6 +73,26 @@ func (a targetAddress) String() string {
 	return netip.AddrPortFrom(a.addr, a.port).String()
 }
 
+func (a targetAddress) network(base string) string {
+	if a.addr.Is4() {
+		return base + "4"
+	}
+	if a.addr.Is6() {
+		return base + "6"
+	}
+	return base
+}
+
+func (a targetAddress) family() string {
+	if a.addr.Is4() {
+		return "IPv4"
+	}
+	if a.addr.Is6() {
+		return "IPv6"
+	}
+	return "IP"
+}
+
 type listenSpec struct {
 	addr      netip.AddrPort
 	canonical string
@@ -271,9 +291,6 @@ func (m *Manager) Apply(rules []config.Rule) error {
 		}
 		if !rule.Enabled {
 			continue
-		}
-		if spec.target.addr.IsValid() && !spec.target.addr.Is4() {
-			return fmt.Errorf("rule %d: target %q resolved to a non-IPv4 address", i+1, rule.Target)
 		}
 		if canLoopBackToListener(spec.listen, spec.target) {
 			if !localAddrsLoaded {
@@ -745,18 +762,38 @@ func resolveTarget(ctx context.Context, raw string) (targetAddress, error) {
 		return targetAddress{addr: target.addr, port: target.port}, nil
 	}
 
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", target.hostname)
+	return resolveTargetWithResolver(ctx, target, net.DefaultResolver)
+}
+
+type targetIPResolver interface {
+	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
+}
+
+func resolveTargetWithResolver(ctx context.Context, target parsedTarget, resolver targetIPResolver) (targetAddress, error) {
+	ips, err := resolver.LookupNetIP(ctx, "ip", target.hostname)
 	if err != nil {
 		return targetAddress{}, err
 	}
+	var ipv6 netip.Addr
 	for _, ip := range ips {
 		ip = ip.Unmap()
-		if !ip.Is4() || !ip.IsValid() {
+		if !ip.IsValid() || ip.IsUnspecified() {
 			continue
 		}
-		return targetAddress{addr: ip, port: target.port}, nil
+		if ip.Is4() {
+			// Prefer IPv4 when a host has both families. This preserves the
+			// previous behavior on dual-stack VPSes while still accepting
+			// IPv6-only targets.
+			return targetAddress{addr: ip, port: target.port}, nil
+		}
+		if ip.Is6() && !ipv6.IsValid() {
+			ipv6 = ip
+		}
 	}
-	return targetAddress{}, fmt.Errorf("hostname %q has no IPv4 address", target.hostname)
+	if ipv6.IsValid() {
+		return targetAddress{addr: ipv6, port: target.port}, nil
+	}
+	return targetAddress{}, fmt.Errorf("hostname %q has no usable IPv4 or IPv6 address", target.hostname)
 }
 
 type parsedTarget struct {
@@ -779,9 +816,6 @@ func parseTargetSyntax(raw string) (parsedTarget, error) {
 	}
 	if addr, err := netip.ParseAddr(host); err == nil {
 		addr = addr.Unmap()
-		if !addr.Is4() {
-			return parsedTarget{}, errors.New("target must resolve to IPv4")
-		}
 		if addr.IsUnspecified() {
 			return parsedTarget{}, errors.New("target must not be the unspecified address")
 		}

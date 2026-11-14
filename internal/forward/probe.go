@@ -143,10 +143,10 @@ func (m *Manager) lockApplyForProbe(ctx context.Context) error {
 
 func probeTarget(ctx context.Context, rule config.Rule) (string, ProbeEndpoint) {
 	// DNS time is excluded from latency_ms: the metric is a TCP handshake to
-	// the resolved IPv4 endpoint, not an application or tunnel round trip.
+	// the resolved IP endpoint, not an application or tunnel round trip.
 	target, err := resolveTarget(ctx, rule.Target)
 	if err != nil {
-		return "", ProbeEndpoint{Status: "error", Message: fmt.Sprintf("目标 IPv4 解析失败：%v", err)}
+		return "", ProbeEndpoint{Status: "error", Message: fmt.Sprintf("目标 IPv4/IPv6 解析失败：%v", err)}
 	}
 	address := target.String()
 	listen, _ := parseListen(rule.Listen)
@@ -162,11 +162,11 @@ func probeTarget(ctx context.Context, rule config.Rule) (string, ProbeEndpoint) 
 	if rule.Network == "udp" {
 		return address, ProbeEndpoint{
 			Status: "unverified", UDPStatus: "unverified",
-			Message: "目标 IPv4 已解析；UDP 没有通用握手，未发送无意义的测试报文。请用真实协议请求及双向流量验证，不能据此判定端口已接通",
+			Message: fmt.Sprintf("目标 %s 已解析；UDP 没有通用握手，未发送无意义的测试报文。请用真实协议请求及双向流量验证，不能据此判定端口已接通", target.family()),
 		}
 	}
 	start := time.Now()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", address)
+	conn, err := (&net.Dialer{}).DialContext(ctx, target.network("tcp"), address)
 	if err != nil {
 		return address, ProbeEndpoint{Status: "error", Message: fmt.Sprintf("本机到目标 TCP 握手失败：%v", err)}
 	}
@@ -178,7 +178,7 @@ func probeTarget(ctx context.Context, rule config.Rule) (string, ProbeEndpoint) 
 	_ = conn.Close()
 	result := ProbeEndpoint{
 		Status: "reachable", LatencyMS: elapsedMS(start),
-		Message: "本机到目标 IPv4 的 TCP 握手成功；延迟不含 DNS，尚未验证应用协议、认证或隧道内的最终目标",
+		Message: fmt.Sprintf("本机到目标 %s 的 TCP 握手成功；延迟不含 DNS，尚未验证应用协议、认证或隧道内的最终目标", target.family()),
 	}
 	if rule.Network == "both" {
 		result.UDPStatus = "unverified"

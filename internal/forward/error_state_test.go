@@ -7,11 +7,20 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/shuichang/relaydeck/internal/config"
 )
+
+func TestUDPTargetRefusedErrorIsActionable(t *testing.T) {
+	err := formatUDPTargetError("read", syscall.ECONNREFUSED)
+	if !strings.Contains(err.Error(), "target UDP port refused or is not listening") ||
+		!errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("refused UDP error = %v", err)
+	}
+}
 
 func TestTCPFailureClearsAfterUpstreamRecovery(t *testing.T) {
 	targetAddress := freeTCPAddress(t)

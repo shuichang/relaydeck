@@ -344,11 +344,11 @@ func (m *Manager) Run(ctx context.Context) {
 func readPair(certPath, keyPath string) (string, string, error) {
 	cert, err := readRegular(certPath, maxCertificateBytes)
 	if err != nil {
-		return "", "", fmt.Errorf("读取证书文件失败: %w", err)
+		return "", "", fmt.Errorf("读取证书文件 %q 失败: %w（请确认路径为绝对路径，且 RelayDeck 服务进程可读取该文件）", certPath, err)
 	}
 	key, err := readRegular(keyPath, maxPrivateKeyBytes)
 	if err != nil {
-		return "", "", fmt.Errorf("读取私钥文件失败: %w", err)
+		return "", "", fmt.Errorf("读取私钥文件 %q 失败: %w（请确认路径为绝对路径，且 RelayDeck 服务进程可读取该文件）", keyPath, err)
 	}
 	return string(cert), string(key), nil
 }

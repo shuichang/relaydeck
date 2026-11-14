@@ -113,6 +113,21 @@ func TestUDPIPv6WildcardAndSpecificReplySource(t *testing.T) {
 		})
 	})
 
+	t.Run("dual-stack IPv4 client to IPv6 target", func(t *testing.T) {
+		ipv6Target, _ := startUDPEcho(t, "[::1]:0")
+		relayPort := freeUDPPortOn(t, "udp6", "::")
+		manager := startUDPTestManager(t, fmt.Sprintf("[::]:%d", relayPort), ipv6Target)
+		exerciseUDPExchange(t, "udp4", "127.0.0.1",
+			&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: relayPort},
+			net.IPv4(127, 0, 0, 1))
+		exerciseConnectedUDPExchange(t, "udp4", "127.0.0.1",
+			&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: relayPort})
+		waitFor(t, 2*time.Second, "IPv4-to-IPv6 UDP sessions", func() bool {
+			snapshot := manager.Snapshot()
+			return len(snapshot) == 1 && snapshot[0].UDPSessions == 2
+		})
+	})
+
 	t.Run("specific IPv6", func(t *testing.T) {
 		relayPort := freeUDPPortOn(t, "udp6", "::1")
 		manager := startUDPTestManager(t, fmt.Sprintf("[::1]:%d", relayPort), target)

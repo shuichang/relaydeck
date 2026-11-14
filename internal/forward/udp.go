@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -195,10 +196,11 @@ func (e *udpEndpoint) forwardDatagram(packet udpPacket, payload []byte) {
 			return
 		}
 		target := netip.AddrPortFrom(e.runtime.spec.target.addr, e.runtime.spec.target.port)
-		conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(target))
+		network := e.runtime.spec.target.network("udp")
+		conn, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(target))
 		if err != nil {
 			e.mu.Unlock()
-			e.runtime.setUDPError(fmt.Errorf("dial udp target: %w", err))
+			e.runtime.setUDPError(formatUDPTargetError("dial", err))
 			return
 		}
 		now := time.Now().UnixNano()
@@ -224,7 +226,7 @@ func (e *udpEndpoint) forwardDatagram(packet udpPacket, payload []byte) {
 
 	_ = session.conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
 	if _, err := session.conn.Write(payload); err != nil {
-		e.runtime.setUDPError(fmt.Errorf("write udp target: %w", err))
+		e.runtime.setUDPError(formatUDPTargetError("write", err))
 		e.removeSession(session)
 		return
 	}
@@ -244,7 +246,7 @@ func (e *udpEndpoint) receiveSession(session *udpSession) {
 		n, _, err := session.conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				e.runtime.setUDPError(fmt.Errorf("read udp target: %w", err))
+				e.runtime.setUDPError(formatUDPTargetError("read", err))
 			}
 			return
 		}
@@ -261,6 +263,13 @@ func (e *udpEndpoint) receiveSession(session *udpSession) {
 		}
 		e.runtime.bytesOut.Add(uint64(n))
 	}
+}
+
+func formatUDPTargetError(operation string, err error) error {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("%s udp target: target UDP port refused or is not listening: %w", operation, err)
+	}
+	return fmt.Errorf("%s udp target: %w", operation, err)
 }
 
 func normalizeClientAddr(client netip.AddrPort) netip.AddrPort {

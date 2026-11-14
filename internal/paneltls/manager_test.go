@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -192,6 +193,21 @@ func TestFileRenewalRetainsLastGoodPair(t *testing.T) {
 	fallback, err := New(opts)
 	if err != nil || fallback.State().ReloadError == "" {
 		t.Fatal("deleted external files must preserve the managed snapshot", err)
+	}
+}
+
+func TestFileSourceErrorIdentifiesUnreadablePath(t *testing.T) {
+	opts, _, _ := fixture(t)
+	manager, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath := filepath.Join(opts.DataDir, "missing", "fullchain.pem")
+	keyPath := filepath.Join(opts.DataDir, "missing", "privkey.pem")
+	if _, err = manager.Apply(Update{Mode: "files", CertPath: certPath, KeyPath: keyPath}); err == nil {
+		t.Fatal("missing certificate file was accepted")
+	} else if !strings.Contains(err.Error(), certPath) || !strings.Contains(err.Error(), "服务进程可读取") {
+		t.Fatalf("file source error omitted actionable path guidance: %v", err)
 	}
 }
 

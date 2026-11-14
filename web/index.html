@@ -261,7 +261,7 @@
             <div>
               <span class="eyebrow">FORWARDING</span>
               <h2>转发规则</h2>
-              <p>监听端口流量并转发到目标 IPv4 地址。保存时由服务端统一校验并原子替换。</p>
+              <p>监听 TCP/UDP 端口流量并透明转发到目标 IP 或主机名。保存时由服务端统一校验并原子替换。</p>
             </div>
             <div class="heading-actions">
               <button id="rules-import" class="button ghost" type="button">
@@ -332,7 +332,7 @@
           <div class="note-grid">
             <article class="info-note">
               <svg class="icon" aria-hidden="true"><use href="#i-info"></use></svg>
-              <div><strong>双栈监听</strong><p><code>[::]:端口</code> 在 Linux 上可同时接受 IPv6 与 IPv4 连接；目标地址需为 IPv4 字面量或解析到 IPv4 的主机名。</p></div>
+              <div><strong>双栈监听</strong><p><code>[::]:端口</code> 在 Linux 上可同时接受 IPv6 与 IPv4 连接。目标可填写 IPv4、带方括号的 IPv6 字面量（如 <code>[2001:db8::1]:443</code>），或解析到 IPv4/IPv6 地址的主机名。</p></div>
             </article>
             <article class="info-note">
               <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
@@ -424,7 +424,7 @@
                 <button id="engine-apply-template" class="button secondary" type="button" disabled>应用模板</button>
               </div>
               <p id="engine-template-description" class="field-hint template-description">选择模板后可继续编辑。</p>
-              <p class="template-guidance">模板只定义可选出站隧道，不限制转发规则的上层协议。普通 TCP/UDP 转发无需协议内核；Reality 模板支持 XUDP 且要求远端兼容，SSH 示例仅 TCP。出站隧道是否支持 UDP 取决于模板及远端。</p>
+              <p class="template-guidance">内置模板覆盖 direct、VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks 2022、SSH、WireGuard，以及 VLESS + WebSocket/gRPC + TLS。普通 TCP/UDP 转发无需协议内核；Reality 模板支持 XUDP 且要求远端兼容，SSH 示例仅 TCP。VLESS 可优先规划 XHTTP 传输，但当前 sing-box 1.14.4 模板集不含 XHTTP，需要在兼容端点侧配置并经实际业务验证；RelayDeck 只透明转发字节，不解析 VLESS 或 Reality。</p>
               <label class="field">
                 <span>JSON 配置</span>
                 <textarea id="engine-config" class="code-editor" spellcheck="false" autocomplete="off" placeholder="{&#10;  &quot;log&quot;: { &quot;level&quot;: &quot;info&quot; }&#10;}"></textarea>
@@ -626,7 +626,7 @@
                     <label class="field">
                       <span>私钥文件路径</span>
                       <input id="tls-key-path-input" class="mono" type="text" spellcheck="false" autocomplete="off" placeholder="/etc/letsencrypt/live/example.com/privkey.pem">
-                      <small>服务器会检查文件并定时检测续期；实际私钥内容不会返回浏览器。systemd 保护可能使 <code>/root</code> 下的路径不可读，请先把证书放到服务可访问的目录。</small>
+                      <small>服务器会检查文件并定时检测续期；实际私钥内容不会返回浏览器。当前 systemd 单元只读开放 <code>/root/cert</code>、<code>/root/.acme.sh</code>，其他用户目录仍隐藏；遇到读取失败请先升级安装器，或使用 <code>/etc/letsencrypt</code>、<code>/etc/ssl</code>、应用数据目录。</small>
                     </label>
                   </section>
 
@@ -686,12 +686,12 @@
             <article class="help-card">
               <span class="help-number">01</span>
               <h3>创建转发规则</h3>
-              <p>填写监听地址与目标地址。端口可写成 <code>:443</code>、<code>0.0.0.0:443</code>、<code>[::]:443</code> 或具体的 IPv4/IPv6 地址。目标必须是 IPv4 字面量，或解析到 IPv4 的主机名。</p>
+              <p>填写监听地址与目标地址。端口可写成 <code>:443</code>、<code>0.0.0.0:443</code>、<code>[::]:443</code> 或具体的 IPv4/IPv6 地址。目标可填写 IPv4、带方括号的 IPv6 字面量，或解析到 IPv4/IPv6 地址的主机名。</p>
             </article>
             <article class="help-card">
               <span class="help-number">02</span>
               <h3>协议与 UDP</h3>
-              <p>普通规则按 TCP/UDP 透明转发，支持的上层协议不受模板限制。出站隧道是否支持 UDP 取决于模板及远端；Reality 模板支持 XUDP，要求远端兼容，SSH 示例仅 TCP。UDP 会话有独立空闲超时。</p>
+              <p>普通规则只透明转发 TCP/UDP 字节，不解析 VLESS、Reality 或 XHTTP。VLESS 可优先规划 XHTTP 传输，但端点兼容性和 TLS/Reality 配置由两端负责；当前内置 sing-box 1.14.4 模板不含 XHTTP。出站隧道是否支持 UDP 取决于模板及远端；Reality 模板支持 XUDP，SSH 示例仅 TCP。</p>
             </article>
             <article class="help-card">
               <span class="help-number">03</span>
@@ -761,9 +761,9 @@
             <small>支持 :端口、IPv4 或 IPv6 监听。</small>
           </label>
           <label class="field">
-            <span>目标 IPv4 地址 <b>*</b></span>
-            <input id="rule-target" class="mono" type="text" placeholder="203.0.113.1:443" spellcheck="false" required>
-            <small>目标必须是 IPv4 字面量或解析到 IPv4 的主机名。</small>
+            <span>目标 IP 或主机名 <b>*</b></span>
+            <input id="rule-target" class="mono" type="text" placeholder="example.com:443" spellcheck="false" required>
+            <small>支持 IPv4、带方括号的 IPv6（如 [2001:db8::1]:443），或解析到 IPv4/IPv6 的主机名。</small>
           </label>
         </div>
         <label class="field">

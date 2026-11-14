@@ -499,7 +499,10 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
+# Keep user homes hidden in a temporary filesystem. These two common ACME
+# certificate directories are exposed read-only for server-file certificates.
+ProtectHome=tmpfs
+BindReadOnlyPaths=-/root/cert -/root/.acme.sh
 ProtectClock=true
 ProtectHostname=true
 ProtectKernelLogs=true

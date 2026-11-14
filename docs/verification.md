@@ -30,7 +30,7 @@ RELAYDECK_SING_BOX=/usr/local/bin/sing-box RELAYDECK_TEST_DOWNLOAD=1 \
 
 该测试隐藏系统 PATH 中的内核来模拟新机器，经登录、CSRF 和同源 API 下载官方内核到临时数据目录，验证安装不会自动启用，然后保存模板、启用、通过真实 TCP/UDP 回显、停用及再次启用；不改动已有服务。CI 也执行该流程。
 
-测试创建临时 HTTP 目标、sing-box 客户端与服务端，并在中间接入 RelayDeck 原生转发器。VLESS、VLESS + Reality 使用 TCP，Hysteria2 使用 QUIC/UDP。每条链路分别验证 IPv4 与 IPv6 入口到 IPv4 服务端，并核对 HTTP 回显内容。Reality 使用本地 TLS 诱饵服务，Hysteria2 显式信任临时证书；不需要真实节点凭据。所有进程与临时监听在测试后关闭。
+测试创建临时 HTTP 目标、sing-box 客户端与服务端，并在中间接入 RelayDeck 原生转发器。VLESS、VLESS + Reality 使用 TCP，Hysteria2 使用 QUIC/UDP。当前签入的链路测试分别验证 IPv4 与 IPv6 入口到 IPv4 服务端，并核对 HTTP 回显内容；它不能替代新增的 IPv4/IPv6 目标地址双族验收。Reality 使用本地 TLS 诱饵服务，Hysteria2 显式信任临时证书；不需要真实节点凭据。所有进程与临时监听在测试后关闭。
 
 CI 对分支 push、PR 和版本 tag 执行普通测试、竞态检测、静态检查、安装脚本检查与真实协议测试。通过后才为版本 tag 构建 amd64、arm64、armv7 安装包并发布 SHA-256 清单。
 
@@ -48,7 +48,7 @@ RELAYDECK_BINARY="$PWD/.tools/relaydeck-ui" node scripts/test-web.cjs
 
 ## 覆盖内容
 
-- 原生 TCP、UDP 与双协议监听，IPv4/IPv6 入站到 IPv4。
+- 原生 TCP、UDP 与双协议监听，以及 IPv4/IPv6 入口。
 - Linux UDP 通配监听保存目的地址与接口，正确回复多 IP 地址并隔离会话。
 - TCP 半关闭、静默上游退出、实时流量计数与连接限制。
 - 新默认上限 8192、最大配置值 65536、旧显式值保留；512 条同时保持的真实 TCP 回显连接。
@@ -65,7 +65,7 @@ RELAYDECK_BINARY="$PWD/.tools/relaydeck-ui" node scripts/test-web.cjs
 - 模板草稿和启用勾选在状态轮询中保留，安装进度与失败重试、安装完成按钮解锁，以及旧响应不能覆盖较新的保存结果。
 - 内核跨进程周期的连续崩溃预算；稳定运行后重置退避状态。
 - 十份 sing-box 配置模板的 JSON 结构及内核兼容性。
-- 通用直连及 Reality/XUDP 模板经 IPv4/IPv6 入口承载普通 TCP 字节与 UDP 报文的真实回显。
+- 通用直连及 Reality/XUDP 模板经 IPv4/IPv6 入口承载普通 TCP 字节与 UDP 报文的真实回显；当前目标的真实协议回显仍使用 IPv4。
 - 安装器拒绝其他进程占用端口、错误版本与不稳定进程的健康响应。
 - 安装器读取本机公网 IPv4/IPv6、外部检测服务不可用时仍使用本机地址、NAT 多服务回退、显式入口覆盖及无效/保留地址过滤；该检测回归以 mock 执行，不依赖真实外部网络。
 
@@ -73,11 +73,13 @@ RELAYDECK_BINARY="$PWD/.tools/relaydeck-ui" node scripts/test-web.cjs
 
 本地与 CI 的协议链路测试不等于每个运营商、真实节点、丢包条件或 MTU 组合的兼容性验证。未对所有路由、所有节点协议和未来版本逐一实测，也不承诺每台 VPS 的吞吐或内存峰值。
 
+目标地址支持 IPv4、带方括号的 IPv6 字面量和解析到两种地址的主机名，需要用真实回显覆盖：仅 A、仅 AAAA、同时返回 A/AAAA（当前选择策略优先 IPv4）、对应地址族的 socket，以及 `[::]:端口` 的 IPv4/IPv6 双栈入口。主机名解析成功只证明选出的地址可用于建连测试，不等于多地址故障转移已经实现。XHTTP 是端点侧传输建议；目前没有内置 XHTTP 模板，也没有 XHTTP 真实链路集成测试，因此文档不宣称 RelayDeck 解析 VLESS、Reality 或 XHTTP。
+
 当前范围不包含端口段批量映射、内核 NAT、客户端源地址保留、跨多条规则的循环图检测、集群高可用、订阅管理、DDNS、NAT 穿透控制面和公网 CA 自动证书续期。协议内核的高级系统接口还受 systemd 沙箱权限约束；当前模板使用常规用户态连接。
 
 ## 2026-11-02 增量优化
 
-详见 [update-2026-11-02.md](update-2026-11-02.md)。浏览器显示的 HTTP 往返包含面板请求和处理耗时，不等于转发端口或代理协议的 RTT。入口只检查本机监听或草稿端口可绑定性；目标毫秒仅代表中转机到目标 IPv4 的 TCP 握手，若目标是本机隧道入口，不能据此判断隧道远端及最终目标可用。UDP 无通用握手，必须由真实协议和双向流量验证。
+详见 [update-2026-11-02.md](update-2026-11-02.md)。浏览器显示的 HTTP 往返包含面板请求和处理耗时，不等于转发端口或代理协议的 RTT。入口只检查本机监听或草稿端口可绑定性；目标毫秒仅代表中转机到解析后目标地址的 TCP 握手，若目标是本机隧道入口，不能据此判断隧道远端及最终目标可用。UDP 无通用握手，必须由真实协议和双向流量验证。
 
 在同一 Linux VPS、相同 Go 版本上保持 1500 条已完成回显的 TCP 连接，新旧实现的保留堆分别为每连接 85,692 与 20,191 字节。基准包含转发器、客户端和回显目标，不能当作生产进程 RSS、所有协议或吞吐保证。可复现：
 

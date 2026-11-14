@@ -1,23 +1,27 @@
 # RelayDeck
 
-RelayDeck 是一个面向公网入口的轻量 TCP/UDP 中转面板。它工作在 L4：转发器只处理连接和字节流，不解析上层内容，因此可以直接承载 VLESS、Reality、Hysteria2、TUIC、TLS、SSH 等协议的 TCP/UDP 流量。协议自身的加密、认证和伪装仍由两端客户端/服务端完成。
+RelayDeck 是一个面向公网入口的轻量 TCP/UDP 中转面板。它工作在 L4：转发器只处理连接、报文边界和字节流，不解析上层内容，因此可以透明承载 VLESS、Reality、XHTTP、Hysteria2、TUIC、TLS、SSH 等协议的 TCP/UDP 流量。协议自身的加密、认证和伪装仍由两端客户端/服务端完成。
 
 RelayDeck 的原生 TCP/UDP 规则转发在进程内完成，无需启动 sing-box 内核。主动出口、代理链和隧道由可选的 sing-box 内核提供；没有安装 sing-box 时，规则转发和面板功能仍可使用。它不依赖 Nginx。
 
 ## 适用范围
 
-- 公网 IPv4/IPv6 入口到固定目标的 TCP/UDP 端口转发。
-- 对 VLESS、Reality、Hysteria2 等协议做透明字节转发，不修改 TLS 握手及 SNI。
+- 公网 IPv4/IPv6 入口到 IPv4/IPv6 目标的 TCP/UDP 端口转发。
+- 对 VLESS、Reality、XHTTP、Hysteria2 等协议做透明字节转发，不修改 TLS 握手及 SNI。
 - 通过可选 sing-box 内核配置主动节点、出口代理或隧道。
 - 单机、低资源 VPS，以及需要明确端口访问控制的场景。
 
+目标可以填写 IPv4 字面量、带方括号的 IPv6 字面量（例如 `[2001:db8::1]:443`），或可解析到 IPv4/IPv6 地址的主机名。主机名同时返回两族地址时优先使用 IPv4，IPv6-only 主机名使用 IPv6。监听 `0.0.0.0:port` 只使用 IPv4 通配地址；`:port` 与 `[::]:port` 使用 IPv6 通配地址，并在 Linux 双栈监听中同时接受 IPv6 与 IPv4 连接。
+
 透明转发能传递协议字节，但不会保留客户端原始源 IP。TCP 和 UDP 上的协议加密会保留；依赖 UDP 的 QUIC/Hysteria2 必须配置 `udp` 或 `both` 规则。未来出现的所有新协议不能预先保证兼容，尤其当协议要求透明源地址、特殊 ICMP 行为、端口跳转或内核级路由时。
+
+为 VLESS 规划中转入口时，推荐优先采用 VLESS + XHTTP 传输；Xray 官方文档也建议从 WebSocket 迁移到 XHTTP。XHTTP、TLS、Reality 和订阅参数都由兼容的服务端与客户端处理。RelayDeck 只转发外层 TCP/TLS（或 HTTP/3 所需的 UDP）字节，不解析 VLESS 或 Reality，也不替端点生成或验证代理参数。当前内置 sing-box 1.14.4 模板集不含 XHTTP 模板，因此这里的推荐不等同于“内置模板已验证”。
 
 每条规则的 `max_connections` 省略或设为 `0` 时采用有限默认上限 `8192`，可显式设置为 `1` 至 `65536`。已有显式值会保留，包括旧配置中的 `256`；它不会因为升级而被自动放大。API 的 `effective_max_connections` 返回最终生效值。
 
-当前 sing-box 1.14.4 的协议支持与限制见 [docs/research.md](docs/research.md)。WireGuard、SSH 等连接可以通过 L4 的 UDP/TCP 规则承载；主动 WireGuard/SSH 出口依赖引擎模板，模板能力受实际安装的内核版本约束。
+当前 sing-box 1.14.4 的协议支持与限制见 [docs/research.md](docs/research.md)。WireGuard、SSH 等连接可以通过 L4 的 UDP/TCP 规则承载；主动 WireGuard/SSH 出口依赖引擎模板，模板能力受实际安装的内核版本约束。内置模板中的 VLESS + Reality、VLESS + WebSocket + TLS 和 VLESS + gRPC + TLS 是 sing-box 配置起点，不能替代对实际节点、认证和 UDP/XUDP 的验证。
 
-测试方法与明确的支持边界见 [docs/verification.md](docs/verification.md)。CI 包含真实 VLESS、VLESS + Reality 和 Hysteria2 的 IPv4/IPv6 转发链路测试。
+测试方法与明确的支持边界见 [docs/verification.md](docs/verification.md)。CI 包含真实 VLESS、VLESS + Reality 和 Hysteria2 的 IPv4/IPv6 入口转发链路测试；XHTTP 尚未列入内置模板集成测试。
 
 ## 安装
 
@@ -35,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.6
+  | bash -s -- --version v0.1.7
 ```
 
 首次安装会：
@@ -86,9 +90,9 @@ systemd 单元启用了文件系统、设备、内核、命名空间、系统调
 
 文件路径模式每 60 秒检查续期后的文件，也可手动重新载入。读取失败、证书过期或私钥尚未更新时，会继续使用上一次有效证书并显示错误；重新启动也保留这份备份。TLS 设置保存在 `/var/lib/relaydeck/tls-settings.json`，权限 `0600`，不包含在普通规则配置导出中。私钥只允许提交，不会通过设置查询接口回显。
 
-公共 CA 证书须通过证书 SAN 中匹配的域名/IP 访问；自签证书更换后可能需要重新确认浏览器信任。当前设置页提供已有证书的配置和续期文件重载，不代办 ACME 申请。文件路径必须能被服务读取，systemd 默认隐藏 `/root` 等用户目录；可使用 `/etc/letsencrypt` 或应用数据目录下的文件。
+公共 CA 证书须通过证书 SAN 中匹配的域名/IP 访问；自签证书更换后可能需要重新确认浏览器信任。当前设置页提供已有证书的配置和续期文件重载，不代办 ACME 申请。当前安装器继续隐藏 `/root`、`/home`，只读开放常见的 `/root/cert` 和 `/root/.acme.sh` 证书目录；其他位置请使用 `/etc/letsencrypt`、`/etc/ssl` 或应用数据目录下的文件。
 
-规则列表会分别显示当前错误和带时间的最近错误记录。TCP 上游连接恢复后清除 TCP 当前错误；UDP 必须收到目标真实回复才标记恢复，两种协议的状态独立。大字号规则名称、地址、状态和检测结果方便桌面与手机查看。
+规则列表会分别显示当前错误和带时间的最近错误记录。规则当前为仅 TCP、历史错误却来自 UDP 时，面板标为“历史错误（UDP）”，并说明当前 UDP 未启用、该历史记录不影响当前 TCP。TCP 上游连接恢复后清除 TCP 当前错误；UDP 必须收到目标真实回复才标记恢复，两种协议的状态独立。大字号规则名称、地址、状态和检测结果方便桌面与手机查看。
 
 ## 可选 sing-box 内核
 
@@ -109,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 三个支持架构的归档 SHA-256 已固定在脚本中，来源为 GitHub Release API 的资产 digest。上游没有独立的签名或 `checksums.txt`；该步骤是发布资产完整性校验，不应描述为上游数字签名验证。如果目标路径已有不同版本的 sing-box，脚本会拒绝覆盖，除非显式传入 `--force`。
 
-模板列表首项 `direct-passthrough` 是通用 TCP/UDP direct 入站到 direct 出站的配置，属于可选的 sing-box 出站隧道，不会限制原生转发规则。Reality 模板可承载配置允许的 TCP 与 UDP 流量，UDP 还要求远端支持 XUDP；Reality 不会自动转换其他协议。SSH 模板仍只承载 TCP。
+内置模板列表包含 `direct-passthrough`、VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks 2022、SSH、WireGuard、VLESS + WebSocket + TLS 和 VLESS + gRPC + TLS。`direct-passthrough` 是通用 TCP/UDP direct 入站到 direct 出站的配置，属于可选的 sing-box 出站隧道，不会限制原生转发规则。Reality 模板可承载配置允许的 TCP 与 UDP 流量，UDP 还要求远端支持 XUDP；Reality 不会自动转换其他协议。SSH 模板仍只承载 TCP。XHTTP 是推荐的 VLESS 传输方案，但当前 sing-box 1.14.4 的内置模板没有它；如使用 Xray/XHTTP 端点，应由端点配置并验证连通性，RelayDeck 不解析该协议。
 
 ## 构建
 

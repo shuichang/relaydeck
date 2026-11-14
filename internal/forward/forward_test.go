@@ -1,10 +1,12 @@
 package forward
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +46,7 @@ func TestValidateRulesRejectsInvalidAndConflictingRules(t *testing.T) {
 		{"network", []config.Rule{with(func(r *config.Rule) { r.Network = "icmp" })}, "network"},
 		{"listen hostname", []config.Rule{with(func(r *config.Rule) { r.Listen = "localhost:12001" })}, "listen host"},
 		{"listen port", []config.Rule{with(func(r *config.Rule) { r.Listen = "127.0.0.1:0" })}, "port"},
-		{"ipv6 target", []config.Rule{with(func(r *config.Rule) { r.Target = "[::1]:9000" })}, "IPv4"},
+		{"invalid target", []config.Rule{with(func(r *config.Rule) { r.Target = "[::1" })}, "missing ']'"},
 		{"empty target host", []config.Rule{with(func(r *config.Rule) { r.Target = ":9000" })}, "empty"},
 		{"cidr", []config.Rule{with(func(r *config.Rule) { r.AllowedCIDRs = []string{"not-a-cidr"} })}, "CIDR"},
 		{"long id", []config.Rule{with(func(r *config.Rule) { r.ID = strings.Repeat("i", maxRuleIDBytes+1) })}, "id exceeds"},
@@ -105,6 +107,45 @@ func TestValidateRulesRejectsInvalidAndConflictingRules(t *testing.T) {
 	if err := ValidateRules(tooMany); err == nil || !strings.Contains(err.Error(), "too many rules") {
 		t.Fatalf("maximum rule count error = %v", err)
 	}
+}
+
+func TestResolveTargetSupportsAOnlyAAAAOnlyAndDualStackResults(t *testing.T) {
+	tests := []struct {
+		name string
+		ips  []netip.Addr
+		want string
+	}{
+		{name: "A only", ips: []netip.Addr{netip.MustParseAddr("192.0.2.10")}, want: "192.0.2.10:443"},
+		{name: "AAAA only", ips: []netip.Addr{netip.MustParseAddr("2001:db8::10")}, want: "[2001:db8::10]:443"},
+		{name: "A and AAAA prefers A", ips: []netip.Addr{
+			netip.MustParseAddr("2001:db8::10"),
+			netip.MustParseAddr("192.0.2.10"),
+		}, want: "192.0.2.10:443"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target, err := resolveTargetWithResolver(
+				context.Background(),
+				parsedTarget{hostname: "fixture.example", port: 443},
+				fakeTargetResolver{ips: test.ips},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := target.String(); got != test.want {
+				t.Fatalf("resolved target = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+type fakeTargetResolver struct {
+	ips []netip.Addr
+	err error
+}
+
+func (r fakeTargetResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return r.ips, r.err
 }
 
 func TestTCPForwardingHalfCloseAndUnchangedRulePreservation(t *testing.T) {
@@ -571,6 +612,148 @@ func TestIPv6ListenerForwardsToIPv4Target(t *testing.T) {
 	}
 }
 
+func TestIPv4ListenerForwardsToIPv6Target(t *testing.T) {
+	target, _ := startTCPEcho(t, "[::1]:0")
+	manager := NewManager()
+	t.Cleanup(manager.Close)
+	listen := freeTCPAddress(t)
+	rule := config.Rule{
+		ID: "v4-input-v6-target", Name: "IPv4 input to IPv6 target", Enabled: true,
+		Network: "tcp", Listen: listen, Target: target, MaxConnections: 4,
+	}
+	if err := manager.Apply([]config.Rule{rule}); err != nil {
+		t.Fatalf("Apply IPv4 listener to IPv6 target: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp4", listen, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial IPv4 listener: %v", err)
+	}
+	payload := []byte("v4-to-v6")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("IPv4 client write: %v", err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("IPv4 client half-close: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := io.ReadAll(conn)
+	_ = conn.Close()
+	if err != nil || string(got) != string(payload) {
+		t.Fatalf("IPv4-to-IPv6 echo = %q, %v", got, err)
+	}
+}
+
+func TestUDPIPv4ListenerForwardsToIPv6Target(t *testing.T) {
+	target, _ := startUDPEcho(t, "[::1]:0")
+	manager := NewManager()
+	t.Cleanup(manager.Close)
+	listen := freeUDPAddress(t)
+	rule := config.Rule{
+		ID: "udp-v4-input-v6-target", Name: "UDP IPv4 input to IPv6 target", Enabled: true,
+		Network: "udp", Listen: listen, Target: target, MaxConnections: 4, UDPTimeout: 5,
+	}
+	if err := manager.Apply([]config.Rule{rule}); err != nil {
+		t.Fatalf("Apply UDP IPv4 listener to IPv6 target: %v", err)
+	}
+	client := dialUDP(t, listen)
+	defer client.Close()
+	sendUDPAndRead(t, client, []byte("udp-v4-to-v6"), []byte("udp-v4-to-v6"))
+}
+
+func TestTCPForwardingSupportsEveryAddressFamilyPair(t *testing.T) {
+	cases := []struct {
+		name       string
+		listenHost string
+		listenNet  string
+		targetHost string
+		clientNet  string
+		payload    string
+	}{
+		{name: "v4-to-v4", listenHost: "127.0.0.1", listenNet: "tcp4", targetHost: "127.0.0.1", clientNet: "tcp4", payload: "tcp-v4-v4"},
+		{name: "v4-to-v6", listenHost: "127.0.0.1", listenNet: "tcp4", targetHost: "::1", clientNet: "tcp4", payload: "tcp-v4-v6"},
+		{name: "v6-to-v4", listenHost: "::1", listenNet: "tcp6", targetHost: "127.0.0.1", clientNet: "tcp6", payload: "tcp-v6-v4"},
+		{name: "v6-to-v6", listenHost: "::1", listenNet: "tcp6", targetHost: "::1", clientNet: "tcp6", payload: "tcp-v6-v6"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target, _ := startTCPEcho(t, net.JoinHostPort(tc.targetHost, "0"))
+			manager := NewManager()
+			t.Cleanup(manager.Close)
+			var listen string
+			if tc.listenNet == "tcp6" {
+				listen = freeTCPAddress6(t)
+			} else {
+				listen = freeTCPAddress(t)
+			}
+			rule := config.Rule{
+				ID: tc.name, Name: tc.name, Enabled: true, Network: "tcp",
+				Listen: net.JoinHostPort(tc.listenHost, mustPort(t, listen)),
+				Target: target, MaxConnections: 4,
+			}
+			if err := manager.Apply([]config.Rule{rule}); err != nil {
+				t.Fatalf("Apply %s: %v", tc.name, err)
+			}
+			conn, err := net.DialTimeout(tc.clientNet, listen, 2*time.Second)
+			if err != nil {
+				t.Fatalf("dial %s listener: %v", tc.name, err)
+			}
+			tcp := conn.(*net.TCPConn)
+			defer tcp.Close()
+			if _, err := tcp.Write([]byte(tc.payload)); err != nil {
+				t.Fatalf("write %s: %v", tc.name, err)
+			}
+			if err := tcp.CloseWrite(); err != nil {
+				t.Fatalf("half-close %s: %v", tc.name, err)
+			}
+			_ = tcp.SetReadDeadline(time.Now().Add(2 * time.Second))
+			got, err := io.ReadAll(tcp)
+			if err != nil || string(got) != tc.payload {
+				t.Fatalf("%s echo = %q, %v", tc.name, got, err)
+			}
+		})
+	}
+}
+
+func TestUDPForwardingSupportsEveryAddressFamilyPair(t *testing.T) {
+	cases := []struct {
+		name       string
+		listenHost string
+		listenNet  string
+		targetHost string
+		clientNet  string
+		payload    string
+	}{
+		{name: "v4-to-v4", listenHost: "127.0.0.1", listenNet: "udp4", targetHost: "127.0.0.1", clientNet: "udp4", payload: "udp-v4-v4"},
+		{name: "v4-to-v6", listenHost: "127.0.0.1", listenNet: "udp4", targetHost: "::1", clientNet: "udp4", payload: "udp-v4-v6"},
+		{name: "v6-to-v4", listenHost: "::1", listenNet: "udp6", targetHost: "127.0.0.1", clientNet: "udp6", payload: "udp-v6-v4"},
+		{name: "v6-to-v6", listenHost: "::1", listenNet: "udp6", targetHost: "::1", clientNet: "udp6", payload: "udp-v6-v6"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target, _ := startUDPEcho(t, net.JoinHostPort(tc.targetHost, "0"))
+			manager := NewManager()
+			t.Cleanup(manager.Close)
+			var listen string
+			if tc.listenNet == "udp6" {
+				listen = freeUDPAddress6(t)
+			} else {
+				listen = freeUDPAddress(t)
+			}
+			rule := config.Rule{
+				ID: tc.name, Name: tc.name, Enabled: true, Network: "udp",
+				Listen: net.JoinHostPort(tc.listenHost, mustPort(t, listen)),
+				Target: target, MaxConnections: 4, UDPTimeout: 5,
+			}
+			if err := manager.Apply([]config.Rule{rule}); err != nil {
+				t.Fatalf("Apply %s: %v", tc.name, err)
+			}
+			client := dialUDPNetwork(t, listen, tc.clientNet)
+			defer client.Close()
+			sendUDPAndRead(t, client, []byte(tc.payload), []byte(tc.payload))
+		})
+	}
+}
+
 func TestCIDRWhitelistAllowsAndRejectsLoopback(t *testing.T) {
 	target, _ := startTCPEcho(t, "127.0.0.1:0")
 	listen := freeTCPAddress(t)
@@ -699,7 +882,7 @@ func TestApplyRollbackRestoresStoppedListenerAndCounters(t *testing.T) {
 
 func startTCPEcho(t *testing.T, address string) (string, *atomic.Int64) {
 	t.Helper()
-	listener, err := net.Listen("tcp4", address)
+	listener, err := net.Listen(tcpTestNetwork(address), address)
 	if err != nil {
 		t.Fatalf("start TCP echo listener: %v", err)
 	}
@@ -797,7 +980,8 @@ func startHoldingTCP(t *testing.T) (string, *atomic.Int64, func()) {
 
 func startUDPEcho(t *testing.T, address string) (string, *atomic.Int64) {
 	t.Helper()
-	conn, err := net.ListenUDP("udp4", mustResolveUDP(t, address))
+	network := udpTestNetwork(address)
+	conn, err := net.ListenUDP(network, mustResolveUDP(t, address))
 	if err != nil {
 		t.Fatalf("start UDP echo socket: %v", err)
 	}
@@ -826,11 +1010,27 @@ func startUDPEcho(t *testing.T, address string) (string, *atomic.Int64) {
 
 func mustResolveUDP(t *testing.T, address string) *net.UDPAddr {
 	t.Helper()
-	addr, err := net.ResolveUDPAddr("udp4", address)
+	addr, err := net.ResolveUDPAddr(udpTestNetwork(address), address)
 	if err != nil {
 		t.Fatalf("resolve UDP address %q: %v", address, err)
 	}
 	return addr
+}
+
+func tcpTestNetwork(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil && net.ParseIP(host) != nil && net.ParseIP(host).To4() == nil {
+		return "tcp6"
+	}
+	return "tcp4"
+}
+
+func udpTestNetwork(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil && net.ParseIP(host) != nil && net.ParseIP(host).To4() == nil {
+		return "udp6"
+	}
+	return "udp4"
 }
 
 func freeTCPAddress(t *testing.T) string {
@@ -838,6 +1038,17 @@ func freeTCPAddress(t *testing.T) string {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve TCP address: %v", err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	return address
+}
+
+func freeTCPAddress6(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Fatalf("reserve IPv6 TCP address: %v", err)
 	}
 	address := listener.Addr().String()
 	_ = listener.Close()
@@ -855,6 +1066,25 @@ func freeUDPAddress(t *testing.T) string {
 	return address
 }
 
+func freeUDPAddress6(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("::1")})
+	if err != nil {
+		t.Fatalf("reserve IPv6 UDP address: %v", err)
+	}
+	address := conn.LocalAddr().String()
+	_ = conn.Close()
+	return address
+}
+
+func mustPort(t *testing.T, address string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("split port %q: %v", address, err)
+	}
+	return port
+}
 func dialTCP(t *testing.T, address string) *net.TCPConn {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp4", address, 2*time.Second)
@@ -867,9 +1097,17 @@ func dialTCP(t *testing.T, address string) *net.TCPConn {
 
 func dialUDP(t *testing.T, address string) *net.UDPConn {
 	t.Helper()
+	return dialUDPNetwork(t, address, "udp4")
+}
+
+func dialUDPNetwork(t *testing.T, address, network string) *net.UDPConn {
+	t.Helper()
 	remote := mustResolveUDP(t, address)
 	local := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
-	conn, err := net.DialUDP("udp4", local, remote)
+	if network == "udp6" {
+		local = &net.UDPAddr{IP: net.ParseIP("::1")}
+	}
+	conn, err := net.DialUDP(network, local, remote)
 	if err != nil {
 		t.Fatalf("dial UDP relay %s: %v", address, err)
 	}

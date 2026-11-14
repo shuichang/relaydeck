@@ -167,7 +167,8 @@ func (e *tcpEndpoint) handle(client *net.TCPConn) {
 		Timeout:   targetDialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
-	upstream, err := dialer.DialContext(e.ctx, "tcp4", e.runtime.spec.target.String())
+	network := e.runtime.spec.target.network("tcp")
+	upstream, err := dialer.DialContext(e.ctx, network, e.runtime.spec.target.String())
 	if err != nil {
 		e.runtime.setTCPError(fmt.Errorf("dial target: %w", err))
 		return
@@ -175,7 +176,7 @@ func (e *tcpEndpoint) handle(client *net.TCPConn) {
 	upstreamTCP, ok := upstream.(*net.TCPConn)
 	if !ok {
 		_ = upstream.Close()
-		e.runtime.setTCPError(errors.New("tcp4 dial returned a non-TCP connection"))
+		e.runtime.setTCPError(fmt.Errorf("%s dial returned a non-TCP connection", network))
 		return
 	}
 	defer upstreamTCP.Close()

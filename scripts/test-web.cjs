@@ -932,6 +932,24 @@ async function run() {
   await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('UDP 恢复尚待真实回包确认'));
   assert.doesNotMatch(await page.locator('#rules-body .rule-history').textContent(), /已恢复/);
   report.ruleUdpRecoveryNotInvented = 'passed';
+
+  ruleHistoryPayload = [{
+    ...saved[0],
+    network: 'tcp',
+    running: true,
+    error: '',
+    error_network: '',
+    last_error: 'historical UDP refusal fixture',
+    last_error_at: '2026-11-05T05:00:00Z',
+    last_recovery_at: '',
+    last_error_network: 'udp',
+  }];
+  await page.locator('#rules-refresh').click();
+  await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('历史错误（UDP）'));
+  const tcpWithUdpHistory = await page.locator('#rules-body .rule-history').textContent();
+  assert.match(tcpWithUdpHistory, /当前 UDP 未启用；此历史错误不影响当前 TCP/);
+  assert.doesNotMatch(tcpWithUdpHistory, /UDP 恢复尚待真实回包确认/);
+  report.tcpRuleLabelsUdpHistory = 'passed';
   await page.unroute('**/api/rules');
   await page.locator('#rules-refresh').click();
   await page.waitForFunction(() => document.getElementById('rules-body').textContent.includes('TCP 连接'));

@@ -1,6 +1,6 @@
 # RelayDeck 技术调研
 
-调研日期：2026-11-01。以下结论以当时可访问的官方文档与发布元数据为准；sing-box 的行为和模板能力应按实际安装版本复核。
+初始调研日期：2026-11-01；文档复核日期：2026-11-14。sing-box 矩阵仍以本仓库固定的 1.14.4 为基准，XHTTP 与当前 Xray 文档单独说明；协议和模板能力都应按实际安装版本复核。
 
 ## 官方资料
 
@@ -11,6 +11,9 @@
 | sing-box 1.14.4 出站索引 | <https://github.com/SagerNet/sing-box/blob/v1.14.4/docs/configuration/outbound/index.md> |
 | sing-box 1.14.4 Endpoint 索引 | <https://github.com/SagerNet/sing-box/blob/v1.14.4/docs/configuration/endpoint/index.md> |
 | sing-box TLS/Reality 配置 | <https://github.com/SagerNet/sing-box/blob/v1.14.4/docs/configuration/shared/tls.md> |
+| sing-box V2Ray Transport | <https://sing-box.sagernet.org/configuration/shared/v2ray-transport/> |
+| Xray Transport Configuration | <https://xtls.github.io/en/config/transport.html> |
+| Xray WebSocket 文档与 XHTTP 建议 | <https://xtls.github.io/en/config/transports/websocket> |
 | Lucky 仓库与功能说明 | <https://github.com/gdy666/lucky> |
 | Lucky 官方文档 | <https://lucky666.cn/docs/intro> |
 | GOST 仓库与功能说明 | <https://github.com/go-gost/gost> |
@@ -53,15 +56,25 @@ sing-box 1.14.4 的 GitHub Release 创建于 2026-10-23，发布日期为 2026-1
 
 矩阵来自上述固定 tag 的文档索引，不把“文档列出一个类型”等同于任意模板已可用。WireGuard 在此版本以 outbound/endpoint 为主；SSH 只有 outbound；它们若要作为目标连接由模板表达，仍受 RelayDeck 当前模板集和实际 sing-box 版本约束。透明 L4 规则则可以直接搬运 WireGuard 的 UDP 包或 SSH 的 TCP 字节，但它们不是由 RelayDeck 解密或终止。
 
+sing-box 1.14.4 文档列出的 V2Ray Transport 为 HTTP、WebSocket、QUIC、gRPC 和 HTTPUpgrade，不包含 XHTTP。XHTTP 是 Xray 的传输方法，不能因为 RelayDeck 能透明转发 TCP/UDP 字节就写成 sing-box 内置模板能力。当前内置十份模板为 `direct-passthrough`、VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks 2022、SSH、WireGuard、VLESS + WebSocket + TLS 和 VLESS + gRPC + TLS；文档没有新增或改写模板代码。
+
+## VLESS、XHTTP 与推荐边界
+
+为 VLESS 规划中转入口时，推荐优先采用 XHTTP。当前 Xray WebSocket 文档明确建议切换到 XHTTP，以避开 WebSocket 较明显的 HTTP/1.1 ALPN 流量特征；Xray 传输兼容矩阵也允许 VLESS 使用 `xhttp`。这是端点侧的传输选择，不是 RelayDeck 的协议解析能力。
+
+在 RelayDeck 前置中转场景中，客户端发往入口的 XHTTP/TLS 连接可以作为普通 TCP 字节流转发；若端点选择 HTTP/3 等 UDP 载体，规则必须启用 UDP。路径、Host、HTTP 版本、XHTTP mode、TLS 或 Reality 参数以及节点认证必须由两端一致配置并实际验证。RelayDeck 不解码 XHTTP 请求，不识别 VLESS UUID 或 Reality 公钥，不改写 HTTP 头，也不因端口可达就证明代理账号、路径或真实目标可用。
+
 ## RelayDeck 的定位边界
 
-RelayDeck 的一等能力是 L4 透明转发。它把 TCP 流或 UDP 会话中的字节原样送往目标，因此 VLESS、Reality、Hysteria2、TUIC、普通 TLS、SSH 等只要只依赖这些字节和网络语义，就不需要专门的协议适配器。优势是协议升级不必修改转发器，代价是它看不到单个用户或子连接的含义。
+RelayDeck 的一等能力是 L4 透明转发。它转发 TCP 流的字节或 UDP 会话中的报文，因此 VLESS、Reality、XHTTP、Hysteria2、TUIC、普通 TLS、SSH 等只要只依赖这些字节和网络语义，就不需要专门的协议适配器。优势是协议升级不必修改转发器，代价是它看不到协议头、用户身份、HTTP 请求或代理子流的含义。
 
 需要写进产品说明的限制：
 
 - **不保留原始源 IP**。目标是普通 TCP/UDP 目标时，目标看到的是 RelayDeck 的出口地址；转发层没有自行注入 PROXY protocol。需要真实来源的协议不能依赖本功能。
 - **TLS SNI 不变**。客户端 TLS ClientHello 被当作不透明字节转发，RelayDeck 不做 SNI 改写或 TLS 终止。
+- **不解析 VLESS/Reality/XHTTP**。RelayDeck 不处理 UUID、Reality 公钥、HTTP 路径、Host 或 XHTTP 会话；这些参数是否匹配只能由端点和真实业务请求证明。
 - **UDP 是必要条件**。QUIC、HTTP/3、Hysteria2、TUIC 需要 UDP；只建 TCP 规则不能承载它们的 QUIC 流量。
+- **不提供代理策略**。目标选择固定到规则解析结果；没有按用户、域名或 HTTP 请求分流，不提供多上游健康检查、负载均衡或跨规则环路检测。
 - **未来协议不保证**。新增协议可能假设原始源地址、ICMP、端口跳跃、特殊分片、内核路由或协议感知；透明转发无法承诺这些能力。
 - **会话生命周期不同**。TCP 是有连接字节流，UDP 是带超时的会话映射；负载均衡、连接计数和目标选择不能把两者简单等同。
 - **主动节点不是透传**。一旦交给 sing-box 出站或 endpoint，协议终止、路由、DNS 和认证语义由 sing-box 配置决定。
