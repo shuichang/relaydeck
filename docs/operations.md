@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.9
+  | bash -s -- --version v0.1.10
 ```
 
 管理面板默认监听 `9443/TCP`。安装时可以自定义端口：
@@ -99,6 +99,8 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 ## 网络与端口
 
 RelayDeck 默认监听所有接口的 `9443/TCP`，也可以通过安装参数改成其他单个 TCP 端口。安装器不执行 `iptables`、`nft`、`ufw`、`firewalld` 或云安全组变更，也不会修改任何全局 sysctl。应自行限制管理端口的来源，并按规则开放实际需要的中转端口。
+
+LXC/NAT 的公网端口映射属于入站链路，必须指向容器内 RelayDeck 实际监听的端口。例如规则监听 `[::]:50001` 时，公网 `50001/TCP` 应映射到容器 `50001/TCP`；如果映射到容器 `81`，规则就必须监听容器的 `81`。需要 UDP 时，公网和容器映射都要单独启用 UDP。面板中的“目标 TCP 可达”只验证 RelayDeck 主机向目标地址的出站 TCP 握手，不验证公网客户端到容器的入站端口。
 
 服务单元只保留 `CAP_NET_BIND_SERVICE`，允许规则监听 1024 以下端口。该单元关闭了 TUN、TProxy 等所需的其他能力；需要这些模式的主动内核配置应单独评估，不应通过放宽整个单元权限来实现。
 

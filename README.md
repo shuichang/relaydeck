@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shuichang/relaydeck/main/scripts/install.sh \
-  | bash -s -- --version v0.1.9
+  | bash -s -- --version v0.1.10
 ```
 
 首次安装会：
@@ -109,7 +109,7 @@ systemd 单元启用了文件系统、设备、内核、命名空间、系统调
 
 本次修复和审查记录见 [docs/core-install-2026-11-02.md](docs/core-install-2026-11-02.md)。
 
-面板安装目录为 `/var/lib/relaydeck/engines/sing-box`（自定义数据目录时为其下的 `engines/sing-box`）。系统 PATH 中的 sing-box 优先，缺少时自动发现私有内核；不会覆盖系统安装。支持 Linux amd64、arm64 和 armv7。使用 `--engine-binary` 自定义其他路径时，请自行安装到指定位置。下载需要服务器能够通过 HTTPS 访问 GitHub 官方 Release；下载归档和解压大小均有限制，并校验固定 SHA-256。
+面板安装目录为 `/var/lib/relaydeck/engines/sing-box`（自定义数据目录时为其下的 `engines/sing-box`）。系统 PATH 中的 sing-box 优先，缺少时自动发现私有内核；不会覆盖系统安装。支持 Linux amd64、arm64 和 armv7。Alpine 使用官方动态 Linux 资产时，面板会在安装过程中检查并自动安装 `gcompat`；如果 Alpine 软件源不可用，页面会显示具体原因。使用 `--engine-binary` 自定义其他内核路径时，请自行安装到指定位置。下载需要服务器能够通过 HTTPS 访问 GitHub 官方 Release；下载归档和解压大小均有限制，并校验固定 SHA-256。
 
 无法从面板安装时，也可在 root 终端使用备用脚本：
 

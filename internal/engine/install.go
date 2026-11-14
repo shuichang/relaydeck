@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -234,6 +235,9 @@ func (i *installer) install(ctx context.Context) error {
 		return err
 	}
 	i.phase("checking")
+	if err := ensureAlpineGcompat(ctx); err != nil {
+		return err
+	}
 	version, err := binaryVersion(binaryPath)
 	if err != nil || version != "sing-box version "+installVersion {
 		return errors.New("下载的内核无法执行或版本不匹配")
@@ -268,6 +272,45 @@ func (i *installer) install(ctx context.Context) error {
 		return errors.New("内核已写入但探测失败，请检查运行权限")
 	}
 	return nil
+}
+
+func ensureAlpineGcompat(ctx context.Context) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if _, err := os.Stat("/etc/alpine-release"); err != nil {
+		return nil
+	}
+	apk, err := exec.LookPath("apk")
+	if err != nil {
+		return errors.New("检测到 Alpine，但找不到 apk；运行官方 sing-box 需要先安装 gcompat")
+	}
+
+	check := exec.CommandContext(ctx, apk, "info", "-e", "gcompat")
+	if err := check.Run(); err == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	install := exec.CommandContext(ctx, apk, "add", "--no-cache", "gcompat")
+	output, err := install.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	detail := strings.TrimSpace(string(output))
+	if detail != "" {
+		detail = redactText(detail, nil)
+		if len(detail) > 1200 {
+			detail = detail[:1200] + "..."
+		}
+		return fmt.Errorf("Alpine 自动安装 gcompat 失败：%s", detail)
+	}
+	return errors.New("Alpine 自动安装 gcompat 失败；请先执行 apk add --no-cache gcompat 后重试")
 }
 
 func (i *installer) download(ctx context.Context, path string) error {

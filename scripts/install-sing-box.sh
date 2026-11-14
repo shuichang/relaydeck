@@ -21,6 +21,18 @@ die() {
   exit 1
 }
 
+ensure_alpine_gcompat() {
+  [[ -f /etc/alpine-release ]] || return 0
+  command -v apk >/dev/null 2>&1 \
+    || die "Alpine requires gcompat to run the official sing-box binary, but apk was not found"
+  if apk info -e gcompat >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'sing-box installer: installing Alpine dependency gcompat...\n' >&2
+  apk add --no-cache gcompat >/dev/null \
+    || die "could not install Alpine dependency gcompat; run apk add --no-cache gcompat and retry"
+}
+
 force=0
 while (($#)); do
   case "$1" in
@@ -101,6 +113,8 @@ member="$(
 tar -xzOf "$archive" "$member" > "$stage"
 [[ -s "$stage" ]] || die "release binary is empty"
 chmod 0700 "$stage"
+
+ensure_alpine_gcompat
 
 actual_version="$("$stage" version 2>&1)" \
   || die "downloaded sing-box binary cannot execute on this host"
