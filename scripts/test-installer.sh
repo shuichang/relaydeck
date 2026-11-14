@@ -71,6 +71,7 @@ source "${tmpdir}/service-helpers.sh"
 service_manager="systemd"
 service_name="relaydeck.service"
 OPENRC_PIDFILE="${tmpdir}/relaydeck.pid"
+: "$service_manager" "$service_name"
 
 test_active=1
 test_main_pid=""
