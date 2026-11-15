@@ -183,6 +183,9 @@ jobs:
       - name: Unit and forwarding tests
         run: cargo test --locked
 
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
       - name: Release build
         run: |
           set -euo pipefail
@@ -191,6 +194,25 @@ jobs:
           file target/release/relaydeck-lite
           test "$(stat -c '%s' target/release/relaydeck-lite)" -lt 12000000
           ./target/release/relaydeck-lite --help
+
+      - name: Alpine musl build and smoke test
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          strip target/x86_64-unknown-linux-musl/release/relaydeck-lite
+          file target/x86_64-unknown-linux-musl/release/relaydeck-lite
+          test "$(stat -c '%s' target/x86_64-unknown-linux-musl/release/relaydeck-lite)" -lt 12000000
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/rust-lite/target/x86_64-unknown-linux-musl/release/relaydeck-lite:/relaydeck-lite:ro" \
+            alpine:3.23 /relaydeck-lite --help
+
+      - name: Check service files
+        run: |
+          bash -n deploy/relaydeck-lite.openrc
+          grep -Fq 'ExecStart=/usr/local/bin/relaydeck-lite run' deploy/relaydeck-lite.service
 
   publish:
     needs:

@@ -16,6 +16,7 @@ KillMode=mixed
 UMask=0077
 LimitNOFILE=65535
 MemoryMax=96M
+CPUQuota=15%
 TasksMax=2048
 NoNewPrivileges=true
 PrivateTmp=true
