@@ -1,7 +1,4 @@
-#![cfg_attr(
-    windows,
-    allow(dead_code, unused_imports, unused_variables)
-)]
+#![cfg_attr(windows, allow(dead_code, unused_imports, unused_variables))]
 
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
