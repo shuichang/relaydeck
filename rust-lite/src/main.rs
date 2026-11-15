@@ -46,6 +46,7 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_BYTES: usize = 128 * 1024;
 const MAX_CONFIG_BYTES: usize = 512 * 1024;
 const MAX_RULE_TEXT_BYTES: usize = 4096;
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 static TARGET_RESOLVER_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -102,6 +103,7 @@ struct Runtime {
     cancel: Option<watch::Sender<u64>>,
     generation: u64,
     active: bool,
+    config_error: bool,
     error: String,
     statuses: HashMap<String, RuleStatus>,
 }
@@ -505,7 +507,9 @@ impl Controller {
 
         self.runtime.cancel = Some(cancel);
         self.runtime.handles = handles;
-        self.runtime.error.clear();
+        if !self.runtime.config_error {
+            self.runtime.error.clear();
+        }
         self.runtime.statuses = statuses
             .into_iter()
             .map(|(id, mut status)| {
@@ -549,6 +553,7 @@ impl Controller {
     async fn commit_config(&mut self, candidate: Config) -> Result<(), String> {
         validate_config(&candidate)?;
         let previous = self.config.clone();
+        let previous_config_error = self.runtime.config_error;
         if let Err(error) = persist_config(&self.config_path, &candidate).await {
             let restore_error = persist_config(&self.config_path, &previous)
                 .await
@@ -562,11 +567,14 @@ impl Controller {
             });
         }
         self.config = candidate;
+        self.runtime.config_error = false;
         if !self.runtime.active {
+            self.runtime.error.clear();
             return Ok(());
         }
         if let Err(error) = self.restart().await {
             self.config = previous.clone();
+            self.runtime.config_error = previous_config_error;
             let restore_error = persist_config(&self.config_path, &previous)
                 .await
                 .err()
@@ -1062,6 +1070,7 @@ async fn run_daemon(
     let mut control = tokio::spawn(control_server(listener, controller.clone(), shutdown_tx));
     if let Some(error) = config_error {
         let mut guard = controller.lock().await;
+        guard.runtime.config_error = true;
         guard.runtime.error = format!("configuration load failed: {error}");
         eprintln!("relaydeck-lite: {}", guard.runtime.error);
     } else if let Err(error) = controller.lock().await.start().await {
@@ -1126,7 +1135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()
         .map_err(|error| boxed_error(error.to_string()))?;
 
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         match command {
             "run" => {
                 let config = PathBuf::from(option(&args, "--config", DEFAULT_CONFIG));
@@ -1181,7 +1190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Err(boxed_error(format!("unknown command: {command}")))
             }
         }
-    })
+    });
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    result
 }
 
 #[cfg(test)]
