@@ -28,7 +28,7 @@ sudo relaydeck-lite run \
 
 默认规则文件是 `/etc/relaydeck-lite/rules.json`，默认控制 socket 是 `/run/relaydeck-lite.sock`。
 
-Debian 使用 `deploy/relaydeck-lite.service`，Alpine 使用 `deploy/relaydeck-lite.openrc`。systemd 服务文件提供文件描述符、任务数和 96 MiB 内存上限；OpenRC 文件使用 `supervise-daemon` 限制崩溃重启次数，并设置文件描述符上限。安装时把二进制放到 `/usr/local/bin/relaydeck-lite`，创建 `/etc/relaydeck-lite` 与 `/var/lib/relaydeck-lite` 后启用对应服务即可。Alpine 的 CPU 和内存硬上限应由容器 cgroup 配置提供。
+Debian 使用 `deploy/relaydeck-lite.service`，Alpine 使用 `deploy/relaydeck-lite.openrc`。systemd 服务文件提供文件描述符、任务数和 96 MiB 内存上限；OpenRC 文件使用 `supervise-daemon` 限制崩溃重启次数，并设置文件描述符上限。安装时把二进制放到 `/usr/local/bin/relaydeck-lite`，创建 `/etc/relaydeck-lite` 与 `/var/lib/relaydeck-lite` 后启用对应服务即可。CPU 配额由 LXC 宿主机 cgroup 提供，服务内部不重复设置 CPUQuota。
 
 ## 终端管理
 
