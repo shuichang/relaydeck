@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -46,6 +46,8 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_BYTES: usize = 128 * 1024;
 const MAX_CONFIG_BYTES: usize = 512 * 1024;
 const MAX_RULE_TEXT_BYTES: usize = 4096;
+
+static TARGET_RESOLVER_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn default_enabled() -> bool {
     true
@@ -100,6 +102,7 @@ struct Runtime {
     cancel: Option<watch::Sender<u64>>,
     generation: u64,
     active: bool,
+    error: String,
     statuses: HashMap<String, RuleStatus>,
 }
 
@@ -215,7 +218,17 @@ fn resolve_target(raw: &str) -> Result<SocketAddr, String> {
 
 async fn resolve_target_async(raw: &str) -> Result<SocketAddr, String> {
     let raw = raw.to_string();
-    let task = tokio::task::spawn_blocking(move || resolve_target(&raw));
+    let slots = TARGET_RESOLVER_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone();
+    let permit = time::timeout(TARGET_RESOLVE_TIMEOUT, slots.acquire_owned())
+        .await
+        .map_err(|_| format!("target resolver slot timed out after {TARGET_RESOLVE_TIMEOUT:?}"))?
+        .map_err(|error| format!("target resolver slot failed: {error}"))?;
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        resolve_target(&raw)
+    });
     time::timeout(TARGET_RESOLVE_TIMEOUT, task)
         .await
         .map_err(|_| format!("target resolution timed out after {TARGET_RESOLVE_TIMEOUT:?}"))?
@@ -266,6 +279,7 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
     if rule.target.trim().is_empty() {
         return Err("target is empty".to_string());
     }
+    resolve_listen(&rule.listen)?;
     endpoint_port(&rule.listen)?;
     endpoint_port(&rule.target)?;
     for (field, value) in [
@@ -414,6 +428,7 @@ impl Controller {
                     statuses.values_mut().for_each(|status| {
                         status.error = message.clone();
                     });
+                    self.runtime.error = message.clone();
                     self.runtime.statuses = statuses;
                     return Err(message);
                 }
@@ -426,6 +441,7 @@ impl Controller {
                     statuses.values_mut().for_each(|status| {
                         status.error = message.clone();
                     });
+                    self.runtime.error = message.clone();
                     self.runtime.statuses = statuses;
                     return Err(message);
                 }
@@ -440,6 +456,7 @@ impl Controller {
                         statuses.values_mut().for_each(|status| {
                             status.error = message.clone();
                         });
+                        self.runtime.error = message.clone();
                         self.runtime.statuses = statuses;
                         return Err(message);
                     }
@@ -456,6 +473,7 @@ impl Controller {
                         statuses.values_mut().for_each(|status| {
                             status.error = message.clone();
                         });
+                        self.runtime.error = message.clone();
                         self.runtime.statuses = statuses;
                         return Err(message);
                     }
@@ -487,6 +505,7 @@ impl Controller {
 
         self.runtime.cancel = Some(cancel);
         self.runtime.handles = handles;
+        self.runtime.error.clear();
         self.runtime.statuses = statuses
             .into_iter()
             .map(|(id, mut status)| {
@@ -521,6 +540,7 @@ impl Controller {
         let statuses: Vec<&RuleStatus> = self.runtime.statuses.values().collect();
         serde_json::to_string_pretty(&serde_json::json!({
             "active": self.runtime.active,
+            "error": self.runtime.error,
             "rules": statuses,
         }))
         .map_err(|error| error.to_string())
@@ -1027,17 +1047,24 @@ async fn run_daemon(
     config_path: PathBuf,
     socket_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = load_config(&config_path)?;
+    let listener = bind_control_listener(&socket_path).await?;
+    let (config, config_error) = match load_config(&config_path) {
+        Ok(config) => (config, None),
+        Err(error) => (Config::default(), Some(error.to_string())),
+    };
     let controller = Arc::new(Mutex::new(Controller {
         config_path,
         config,
         runtime: Runtime::default(),
     }));
-    let listener = bind_control_listener(&socket_path).await?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let socket_for_cleanup = socket_path.clone();
     let mut control = tokio::spawn(control_server(listener, controller.clone(), shutdown_tx));
-    if let Err(error) = controller.lock().await.start().await {
+    if let Some(error) = config_error {
+        let mut guard = controller.lock().await;
+        guard.runtime.error = format!("configuration load failed: {error}");
+        eprintln!("relaydeck-lite: {}", guard.runtime.error);
+    } else if let Err(error) = controller.lock().await.start().await {
         eprintln!("relaydeck-lite: initial rule start failed: {error}");
     }
     tokio::select! {
@@ -1207,6 +1234,21 @@ mod tests {
             udp_timeout: DEFAULT_UDP_TIMEOUT,
         };
         assert!(validate_rule(&rule).is_ok());
+    }
+
+    #[test]
+    fn hostname_listen_is_rejected() {
+        let rule = Rule {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            enabled: true,
+            network: "tcp".to_string(),
+            listen: "localhost:50001".to_string(),
+            target: "127.0.0.1:443".to_string(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            udp_timeout: DEFAULT_UDP_TIMEOUT,
+        };
+        assert!(validate_rule(&rule).is_err());
     }
 
     #[test]
