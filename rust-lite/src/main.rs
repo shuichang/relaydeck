@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     env,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, ErrorKind, Write},
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
@@ -41,8 +41,11 @@ const MAX_RULES: usize = 256;
 const GLOBAL_TCP_SESSIONS: usize = 512;
 const GLOBAL_UDP_SESSIONS: usize = 256;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TARGET_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_COMMAND_BYTES: usize = 128 * 1024;
+const MAX_CONFIG_BYTES: usize = 512 * 1024;
+const MAX_RULE_TEXT_BYTES: usize = 4096;
 
 fn default_enabled() -> bool {
     true
@@ -167,14 +170,55 @@ fn resolve_listen(raw: &str) -> Result<SocketAddr, String> {
         .map_err(|error| format!("{raw}: {error}"))
 }
 
+fn endpoint_port(raw: &str) -> Result<u16, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("endpoint is empty".to_string());
+    }
+    if let Ok(address) = normalize_listen(trimmed).parse::<SocketAddr>() {
+        return if address.port() == 0 {
+            Err("endpoint port must be between 1 and 65535".to_string())
+        } else {
+            Ok(address.port())
+        };
+    }
+
+    let port = if trimmed.starts_with('[') {
+        let close = trimmed
+            .find(']')
+            .ok_or_else(|| "IPv6 endpoint is missing ]".to_string())?;
+        trimmed
+            .get(close + 1..)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .ok_or_else(|| "IPv6 endpoint must use [address]:port".to_string())?
+    } else {
+        let (host, port) = trimmed
+            .rsplit_once(':')
+            .ok_or_else(|| "endpoint must use host:port".to_string())?;
+        if host.is_empty() || host.contains(':') {
+            return Err("IPv6 endpoint must use [address]:port".to_string());
+        }
+        port
+    };
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "endpoint port must be between 1 and 65535".to_string())?;
+    if port == 0 {
+        return Err("endpoint port must be between 1 and 65535".to_string());
+    }
+    Ok(port)
+}
+
 fn resolve_target(raw: &str) -> Result<SocketAddr, String> {
     resolve_one(raw)
 }
 
 async fn resolve_target_async(raw: &str) -> Result<SocketAddr, String> {
     let raw = raw.to_string();
-    tokio::task::spawn_blocking(move || resolve_target(&raw))
+    let task = tokio::task::spawn_blocking(move || resolve_target(&raw));
+    time::timeout(TARGET_RESOLVE_TIMEOUT, task)
         .await
+        .map_err(|_| format!("target resolution timed out after {TARGET_RESOLVE_TIMEOUT:?}"))?
         .map_err(|error| format!("target resolver task failed: {error}"))?
 }
 
@@ -222,11 +266,17 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
     if rule.target.trim().is_empty() {
         return Err("target is empty".to_string());
     }
-    if resolve_listen(&rule.listen)?.port() == 0 {
-        return Err("listen port must be between 1 and 65535".to_string());
-    }
-    if resolve_target(&rule.target)?.port() == 0 {
-        return Err("target port must be between 1 and 65535".to_string());
+    endpoint_port(&rule.listen)?;
+    endpoint_port(&rule.target)?;
+    for (field, value) in [
+        ("id", rule.id.as_str()),
+        ("name", rule.name.as_str()),
+        ("listen", rule.listen.as_str()),
+        ("target", rule.target.as_str()),
+    ] {
+        if value.len() > MAX_RULE_TEXT_BYTES {
+            return Err(format!("{field} exceeds {MAX_RULE_TEXT_BYTES} bytes"));
+        }
     }
     if rule.max_connections == 0 || rule.max_connections > 65_536 {
         return Err("max_connections must be between 1 and 65536".to_string());
@@ -258,6 +308,12 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error + Send +
     if !path.exists() {
         return Ok(Config::default());
     }
+    let size = fs::metadata(path)?.len();
+    if size > MAX_CONFIG_BYTES as u64 {
+        return Err(boxed_error(format!(
+            "configuration exceeds {MAX_CONFIG_BYTES} bytes"
+        )));
+    }
     let data = fs::read(path)?;
     let config: Config = serde_json::from_slice(&data)?;
     validate_config(&config).map_err(boxed_error)?;
@@ -278,6 +334,11 @@ fn save_config(
         .as_nanos();
     let temp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nonce));
     let data = serde_json::to_vec_pretty(config)?;
+    if data.len() > MAX_CONFIG_BYTES {
+        return Err(boxed_error(format!(
+            "configuration exceeds {MAX_CONFIG_BYTES} bytes"
+        )));
+    }
     let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut file = File::create(&temp)?;
         set_private_mode(&temp)?;
@@ -291,6 +352,17 @@ fn save_config(
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+async fn persist_config(
+    path: &Path,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = path.to_path_buf();
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || save_config(&path, &config))
+        .await
+        .map_err(|error| boxed_error(format!("configuration writer task failed: {error}")))?
 }
 
 fn set_private_mode(path: &Path) -> io::Result<()> {
@@ -338,16 +410,24 @@ impl Controller {
                 Ok(target) => target,
                 Err(error) => {
                     abort_handles(&mut handles).await;
+                    let message = format!("rule {} target: {error}", rule.id);
+                    statuses.values_mut().for_each(|status| {
+                        status.error = message.clone();
+                    });
                     self.runtime.statuses = statuses;
-                    return Err(format!("rule {} target: {error}", rule.id));
+                    return Err(message);
                 }
             };
             let listen = match resolve_listen(&rule.listen) {
                 Ok(listen) => listen,
                 Err(error) => {
                     abort_handles(&mut handles).await;
+                    let message = format!("rule {} listen: {error}", rule.id);
+                    statuses.values_mut().for_each(|status| {
+                        status.error = message.clone();
+                    });
                     self.runtime.statuses = statuses;
-                    return Err(format!("rule {} listen: {error}", rule.id));
+                    return Err(message);
                 }
             };
 
@@ -356,7 +436,12 @@ impl Controller {
                     Ok(listener) => Some(listener),
                     Err(error) => {
                         abort_handles(&mut handles).await;
-                        return Err(format!("rule {} TCP bind {}: {error}", rule.id, listen));
+                        let message = format!("rule {} TCP bind {}: {error}", rule.id, listen);
+                        statuses.values_mut().for_each(|status| {
+                            status.error = message.clone();
+                        });
+                        self.runtime.statuses = statuses;
+                        return Err(message);
                     }
                 }
             } else {
@@ -367,18 +452,23 @@ impl Controller {
                     Ok(socket) => Some(socket),
                     Err(error) => {
                         abort_handles(&mut handles).await;
-                        return Err(format!("rule {} UDP bind {}: {error}", rule.id, listen));
+                        let message = format!("rule {} UDP bind {}: {error}", rule.id, listen);
+                        statuses.values_mut().for_each(|status| {
+                            status.error = message.clone();
+                        });
+                        self.runtime.statuses = statuses;
+                        return Err(message);
                     }
                 }
             } else {
                 None
             };
+            let rule_semaphore = Arc::new(Semaphore::new(rule.max_connections as usize));
             if let Some(listener) = tcp_listener {
-                let semaphore = Arc::new(Semaphore::new(rule.max_connections as usize));
                 handles.push(tokio::spawn(run_tcp(
                     listener,
                     target,
-                    semaphore,
+                    rule_semaphore.clone(),
                     global_tcp.clone(),
                     receiver.clone(),
                 )));
@@ -388,6 +478,7 @@ impl Controller {
                     rule.clone(),
                     socket,
                     target,
+                    rule_semaphore,
                     global_udp.clone(),
                     receiver.clone(),
                 )));
@@ -438,14 +529,26 @@ impl Controller {
     async fn commit_config(&mut self, candidate: Config) -> Result<(), String> {
         validate_config(&candidate)?;
         let previous = self.config.clone();
-        save_config(&self.config_path, &candidate).map_err(|error| error.to_string())?;
+        if let Err(error) = persist_config(&self.config_path, &candidate).await {
+            let restore_error = persist_config(&self.config_path, &previous)
+                .await
+                .err()
+                .map(|restore| restore.to_string());
+            return Err(match restore_error {
+                None => format!("configuration save failed and was rolled back: {error}"),
+                Some(restore) => {
+                    format!("configuration save failed: {error}; rollback failed: {restore}")
+                }
+            });
+        }
         self.config = candidate;
         if !self.runtime.active {
             return Ok(());
         }
         if let Err(error) = self.restart().await {
             self.config = previous.clone();
-            let restore_error = save_config(&self.config_path, &previous)
+            let restore_error = persist_config(&self.config_path, &previous)
+                .await
                 .err()
                 .map(|restore| restore.to_string());
             let restart_error = self.restart().await.err();
@@ -519,6 +622,7 @@ struct UdpAssociation {
     last_seen: Arc<AtomicU64>,
     abort: AbortHandle,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _rule_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 async fn bind_udp_target(target: SocketAddr) -> io::Result<UdpSocket> {
@@ -535,6 +639,7 @@ async fn run_udp(
     rule: Rule,
     socket: UdpSocket,
     target: SocketAddr,
+    rule_semaphore: Arc<Semaphore>,
     global_semaphore: Arc<Semaphore>,
     mut cancel: watch::Receiver<u64>,
 ) {
@@ -572,8 +677,13 @@ async fn run_udp(
                     let Ok(permit) = global_semaphore.clone().try_acquire_owned() else {
                         continue;
                     };
+                    let Ok(rule_permit) = rule_semaphore.clone().try_acquire_owned() else {
+                        drop(permit);
+                        continue;
+                    };
                     let Ok(target_socket) = bind_udp_target(target).await else {
                         drop(permit);
+                        drop(rule_permit);
                         continue;
                     };
                     let target_socket = Arc::new(target_socket);
@@ -600,6 +710,7 @@ async fn run_udp(
                         last_seen,
                         abort,
                         _permit: permit,
+                        _rule_permit: rule_permit,
                     });
                     Some(target_socket)
                 } else {
@@ -794,26 +905,55 @@ async fn handle_control_connection(
 }
 
 #[cfg(unix)]
-async fn control_server(
-    socket_path: PathBuf,
-    controller: Arc<Mutex<Controller>>,
-    shutdown: watch::Sender<bool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if socket_path.exists() {
-        let metadata = fs::symlink_metadata(&socket_path)?;
-        if !metadata.file_type().is_socket() {
-            return Err(boxed_error(format!(
-                "refusing to remove non-socket control path: {}",
-                socket_path.display()
-            )));
+async fn bind_control_listener(
+    socket_path: &Path,
+) -> Result<UnixListener, Box<dyn std::error::Error + Send + Sync>> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(boxed_error(format!(
+                    "refusing to remove non-socket control path: {}",
+                    socket_path.display()
+                )));
+            }
+            match UnixStream::connect(socket_path).await {
+                Ok(_) => {
+                    return Err(boxed_error(format!(
+                        "control socket is already in use: {}",
+                        socket_path.display()
+                    )));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                    ) => {}
+                Err(error) => {
+                    return Err(boxed_error(format!(
+                        "cannot inspect existing control socket {}: {error}",
+                        socket_path.display()
+                    )));
+                }
+            }
+            fs::remove_file(socket_path)?;
         }
-        fs::remove_file(&socket_path)?;
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let listener = UnixListener::bind(&socket_path)?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(socket_path)?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+async fn control_server(
+    listener: UnixListener,
+    controller: Arc<Mutex<Controller>>,
+    shutdown: watch::Sender<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(connection) => connection,
@@ -893,13 +1033,13 @@ async fn run_daemon(
         config,
         runtime: Runtime::default(),
     }));
-    {
-        let mut guard = controller.lock().await;
-        guard.start().await.map_err(boxed_error)?;
-    }
+    let listener = bind_control_listener(&socket_path).await?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let socket_for_cleanup = socket_path.clone();
-    let mut control = tokio::spawn(control_server(socket_path, controller.clone(), shutdown_tx));
+    let mut control = tokio::spawn(control_server(listener, controller.clone(), shutdown_tx));
+    if let Err(error) = controller.lock().await.start().await {
+        eprintln!("relaydeck-lite: initial rule start failed: {error}");
+    }
     tokio::select! {
         result = &mut control => {
             result??;
@@ -1054,6 +1194,28 @@ mod tests {
         assert!(validate_rule(&rule).is_err());
     }
 
+    #[test]
+    fn hostname_target_is_validated_without_dns_lookup() {
+        let rule = Rule {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            enabled: true,
+            network: "tcp".to_string(),
+            listen: ":50001".to_string(),
+            target: "not-resolvable.invalid:443".to_string(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            udp_timeout: DEFAULT_UDP_TIMEOUT,
+        };
+        assert!(validate_rule(&rule).is_ok());
+    }
+
+    #[test]
+    fn endpoint_ports_require_bracketed_ipv6() {
+        assert_eq!(endpoint_port("example.com:443").expect("domain port"), 443);
+        assert_eq!(endpoint_port("[2001:db8::1]:443").expect("IPv6 port"), 443);
+        assert!(endpoint_port("2001:db8::1:443").is_err());
+    }
+
     fn test_rule(network: &str, timeout: u64) -> Rule {
         Rule {
             id: "test".to_string(),
@@ -1121,6 +1283,7 @@ mod tests {
             test_rule("udp", 5),
             listener,
             target_addr,
+            Arc::new(Semaphore::new(8)),
             Arc::new(Semaphore::new(GLOBAL_UDP_SESSIONS)),
             receiver,
         ));

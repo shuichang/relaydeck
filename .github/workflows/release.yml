@@ -195,6 +195,16 @@ jobs:
           test "$(stat -c '%s' target/release/relaydeck-lite)" -lt 12000000
           ./target/release/relaydeck-lite --help
 
+      - name: Package glibc binary
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          tar -C target/release -czf \
+            "dist/relaydeck-lite_${version}_linux_amd64_gnu.tar.gz" \
+            relaydeck-lite
+
       - name: Alpine musl build and smoke test
         run: |
           set -euo pipefail
@@ -209,6 +219,25 @@ jobs:
             -v "$GITHUB_WORKSPACE/rust-lite/target/x86_64-unknown-linux-musl/release/relaydeck-lite:/relaydeck-lite:ro" \
             alpine:3.23 /relaydeck-lite --help
 
+      - name: Package musl binary
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          tar -C target/x86_64-unknown-linux-musl/release -czf \
+            "dist/relaydeck-lite_${version}_linux_amd64_musl.tar.gz" \
+            relaydeck-lite
+
+      - name: Upload Rust Lite release archives
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: relaydeck-lite-linux-amd64
+          path: rust-lite/dist/relaydeck-lite_*_linux_amd64_*.tar.gz
+          if-no-files-found: error
+          retention-days: 2
+
       - name: Check service files
         run: |
           bash -n deploy/relaydeck-lite.openrc
@@ -218,6 +247,7 @@ jobs:
     needs:
       - verify
       - build
+      - rust-lite
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -236,13 +266,22 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Download Rust Lite archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: relaydeck-lite-linux-*
+          path: dist
+          merge-multiple: true
+
       - name: Create checksums
         working-directory: dist
         run: |
           set -euo pipefail
-          count="$(find . -maxdepth 1 -type f -name 'relaydeck_*_linux_*.tar.gz' | wc -l)"
-          test "${count}" -eq 3
-          sha256sum relaydeck_*_linux_*.tar.gz > checksums.txt
+          main_count="$(find . -maxdepth 1 -type f -name 'relaydeck_*_linux_*.tar.gz' | wc -l)"
+          lite_count="$(find . -maxdepth 1 -type f -name 'relaydeck-lite_*_linux_*.tar.gz' | wc -l)"
+          test "${main_count}" -eq 3
+          test "${lite_count}" -eq 2
+          sha256sum relaydeck_*_linux_*.tar.gz relaydeck-lite_*_linux_*.tar.gz > checksums.txt
           sha256sum -c checksums.txt
           cat checksums.txt
 
@@ -254,11 +293,11 @@ jobs:
           set -euo pipefail
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" \
-              relaydeck_*_linux_*.tar.gz checksums.txt \
+              relaydeck_*_linux_*.tar.gz relaydeck-lite_*_linux_*.tar.gz checksums.txt \
               --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
-              relaydeck_*_linux_*.tar.gz checksums.txt \
+              relaydeck_*_linux_*.tar.gz relaydeck-lite_*_linux_*.tar.gz checksums.txt \
               --verify-tag \
               --generate-notes
           fi

@@ -4,7 +4,7 @@ RelayDeck Lite 是 RelayDeck 的轻量 Rust 分支，面向 128 MiB 内存、低
 
 运行时使用 Tokio 单线程调度器。TCP 连接使用异步双向复制，UDP 使用按客户端地址建立的短生命周期关联。管理通过 Unix 控制 socket 完成，不启动 Web 服务。
 
-默认每条规则最多 512 个会话，同时受进程级 512 个 TCP 会话和 256 个 UDP 会话预算约束，避免单条规则或多条规则把 128 MiB 容器的内存耗尽。需要更高容量时应先做 cgroup RSS 和连接压力测试，再调整源码常量与服务资源限制。
+默认每条规则最多 512 个会话（`both` 规则的 TCP 与 UDP 共享这个上限），同时受进程级 512 个 TCP 会话和 256 个 UDP 会话预算约束，避免单条规则或多条规则把 128 MiB 容器的内存耗尽。需要更高容量时应先做 cgroup RSS 和连接压力测试，再调整源码常量与服务资源限制。
 
 ## 构建
 
@@ -28,7 +28,7 @@ sudo relaydeck-lite run \
 
 默认规则文件是 `/etc/relaydeck-lite/rules.json`，默认控制 socket 是 `/run/relaydeck-lite.sock`。
 
-Debian 使用 `deploy/relaydeck-lite.service`，Alpine 使用 `deploy/relaydeck-lite.openrc`。systemd 服务文件提供文件描述符、任务数和 96 MiB 内存上限；OpenRC 文件使用 `supervise-daemon` 限制崩溃重启次数，并设置文件描述符上限。安装时把二进制放到 `/usr/local/bin/relaydeck-lite`，创建 `/etc/relaydeck-lite` 与 `/var/lib/relaydeck-lite` 后启用对应服务即可。CPU 配额由 LXC 宿主机 cgroup 提供，服务内部不重复设置 CPUQuota。
+Debian 使用 `deploy/relaydeck-lite.service`，Alpine 使用 `deploy/relaydeck-lite.openrc`。systemd 服务文件提供文件描述符、任务数和 96 MiB 内存上限；OpenRC 文件使用 `supervise-daemon` 限制崩溃重启次数，并设置文件描述符上限。安装时把二进制放到 `/usr/local/bin/relaydeck-lite`，创建 `/etc/relaydeck-lite` 与 `/var/lib/relaydeck-lite` 后启用对应服务即可。CPU 配额由 LXC 宿主机 cgroup 提供，服务内部不重复设置 CPUQuota。首次启动即使规则 DNS 失败或监听端口冲突，Unix 控制 socket 仍会保留，可以先用 `status`、`update` 或 `delete` 修复配置，再执行 `start`。
 
 ## 终端管理
 
