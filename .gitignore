@@ -9,3 +9,4 @@ coverage.out
 relaydeck.json
 tls-settings.json
 relaydeck-data/
+rust-lite/target/

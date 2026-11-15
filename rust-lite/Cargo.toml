@@ -1,0 +1,26 @@
+[package]
+name = "relaydeck-lite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = [
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+name="relaydeck-lite"
+description="RelayDeck Lite TCP/UDP relay"
+command="/usr/local/bin/relaydeck-lite"
+command_args="run --config /etc/relaydeck-lite/rules.json --socket /run/relaydeck-lite.sock"
+command_user="root:root"
+directory="/var/lib/relaydeck-lite"
+pidfile="/run/relaydeck-lite.pid"
+command_background=true
+retry="SIGTERM/10 SIGKILL/5"
+umask=0077
+
+depend() {
+	need net
+	after firewall
+}

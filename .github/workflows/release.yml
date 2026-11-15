@@ -165,6 +165,33 @@ jobs:
           if-no-files-found: error
           retention-days: 2
 
+  rust-lite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: rust-lite
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Unit and forwarding tests
+        run: cargo test --locked
+
+      - name: Release build
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          strip target/release/relaydeck-lite
+          file target/release/relaydeck-lite
+          test "$(stat -c '%s' target/release/relaydeck-lite)" -lt 12000000
+          ./target/release/relaydeck-lite --help
+
   publish:
     needs:
       - verify
